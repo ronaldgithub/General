@@ -1,0 +1,124 @@
+# CLAUDE.md
+
+Guidance for working in this repository.
+
+## What this is
+
+`BackupChainCheck` is a **read-only Windows PowerShell 5.1** tool that reconciles
+Ola Hallengren `DatabaseBackup` retention (`@CleanupTime`, in hours) and schedule
+against the backup files actually present on disk, and reports recovery-coverage
+gaps. See `README.md` for the functional design and the reconciliation math.
+
+Core rule: **the tool must never write to SQL Server and never delete or modify
+backup files.** Every SQL query is read-only against `msdb`. Every filesystem
+operation is enumeration only.
+
+## Runtime target: Windows PowerShell 5.1 only
+
+Do **not** use PowerShell 7+ syntax. In particular, these are unavailable and will
+break under 5.1:
+
+- Ternary `a ? b : c`, null-coalescing `??`, null-conditional `?.`
+- Pipeline chain operators `&&` / `||` (in scripts)
+- `ForEach-Object -Parallel`, `Get-Error`, `Get-Uptime`
+- `ConvertFrom-Json -AsHashtable`, `ConvertTo-Json -EnumsAsStrings`
+- `[System.Text.Json]` (use `ConvertTo-Json` / `ConvertFrom-Json`)
+- `Clean {}` blocks, `using namespace` for arbitrary assemblies not loaded by 5.1
+
+Use instead:
+- `if/else`, explicit `$null -eq $x` checks (null on the left)
+- `[pscustomobject]@{ ... }` for output records
+- `System.Data.SqlClient` (built into .NET Framework 4.x, always present in 5.1)
+- `#Requires -Version 5.1` at the top of every script/module
+
+Every script starts with:
+
+```powershell
+#Requires -Version 5.1
+Set-StrictMode -Version 1.0
+$ErrorActionPreference = 'Stop'
+```
+
+**StrictMode is 1.0, not 2.0+, on purpose.** 2.0+ turns PowerShell's
+scalar/collection unification into hard errors — `.Count` on a single object,
+member enumeration (`$x.Prop`) over a possibly-empty result — which this code
+relies on heavily. 1.0 still catches the bug that actually bites (typo'd /
+uninitialised variables). If you raise it, you must wrap every possibly-scalar
+expression in `@(...)` before `.Count` or `[index]` and guard every `.Prop`
+enumeration — not worth it here.
+
+## Repository layout
+
+Today it is one self-contained script plus tests:
+
+```
+Invoke-BackupChainCheck.ps1              The whole tool. param() block, helper
+                                         functions in #region blocks, then a
+                                         #region Main that runs the analysis.
+                                         Returns early when dot-sourced
+                                         (InvocationName -eq '.') so tests can
+                                         load the functions without running it.
+expectations.sample.json                 Template for -ConfigPath.
+tests/Invoke-BackupChainCheck.Tests.ps1  Pester tests (parsing + math), no SQL.
+```
+
+Internal structure of the script, in order:
+
+- `New-Finding` / `Get-DurationText` / `Get-Median` — small helpers.
+- `ConvertFrom-OlaBackupFile` — one FileInfo (or stand-in) → parsed record.
+  Directory structure trusted first, file name is the fallback.
+- `Get-BackupFileInventory` / `Group-LogicalBackup` — scan + collapse striping.
+- `Invoke-SqlQuery` — thin read-only ADO.NET helper.
+- `Get-OlaJobConfig` — regex `@CleanupTime` / `@CleanupMode` / `@NumberOfFiles` /
+  `@BackupType` / `@Databases` / `@Directory` out of `msdb.dbo.sysjobsteps`.
+- `Get-OlaCommandLog` — `BACKUP_DATABASE` / `BACKUP_LOG` rows from
+  `<SolutionDatabase>.dbo.CommandLog`; returns `$null` if the table is absent.
+- `Get-SqlDatabaseInfo` — `sys.databases` recovery model / state / last backup.
+- `Expand-DatabaseScope` — Ola `@Databases` token → concrete database list.
+- `Get-ExpectationModel` — layers interval (files → CommandLog → config → params)
+  and retention (config defaults → job → config per-db → params) into
+  `$model[db][type]`.
+- `Test-BackupChain` — every check; emits `New-Finding` objects.
+- `Write-HtmlReport`.
+
+**A future module split** (`BackupChainCheck.psd1` + `.psm1` + `src/` with one
+public function per file, `docs/ola-conventions.md`) is fine to do later, but keep
+the single-script entry point working — it is what the README documents.
+
+## Coding conventions
+
+- Approved verbs only (`Get-Verb`). Public functions: `[CmdletBinding()]`,
+  comment-based help, typed + validated parameters, pipeline-friendly.
+- Emit **objects, not text**. No `Write-Host` for data; use `Write-Verbose`,
+  `Write-Warning`, `Write-Error` for diagnostics and the pipeline for results.
+- Findings are `[pscustomobject]` with a stable shape:
+  `Instance, Database, BackupType, Severity ('Error'|'Warning'|'Info'), Finding, Expected, Found, Detail`.
+- SQL access is plain ADO.NET (`System.Data.SqlClient`) via `Invoke-SqlQuery`.
+  No dependency on the `SqlServer` / `SQLPS` module — do not add one. All queries
+  are read-only against `msdb`, `master` / `sys.databases`, and `dbo.CommandLog`.
+- SQL failures degrade gracefully: wrap the calls in `try/catch`, `Write-Warning`,
+  and carry on with whatever inputs are available.
+- Paths: support local and UNC. `Get-ChildItem -Recurse -File -Include` is fine at
+  current scale; switch to `[System.IO.Directory]::EnumerateFiles` only if a real
+  large-tree problem shows up.
+- Dates: the file-name timestamp is the source of truth for backup time. `AgeHours`
+  is computed once against `$script:Now`. Clock/timezone skew between the backup
+  host and the checking host is a known limitation — noted in the README.
+
+## Testing
+
+- Pester, syntax compatible with **Pester 3.4** (in-box on Windows): `Describe` /
+  `It` / `Should Be`. Avoid 4.x/5.x-only forms (`Should -Be`, `-Show`).
+- Tests dot-source the script (`. $scriptPath -BackupPath $env:TEMP`) and call the
+  internal functions directly. `ConvertFrom-OlaBackupFile` takes an untyped `$File`
+  so tests can pass a lightweight stand-in instead of a real `FileInfo`.
+- `Invoke-Pester -Path .\tests` must pass before any commit. No live SQL Server.
+- If PSScriptAnalyzer is available, keep it clean; the editor also surfaces its
+  rules inline (unused variables, unapproved verbs).
+
+## Safety / scope
+
+- Read-only everywhere. If a change would write to SQL Server or touch a backup
+  file, stop and flag it.
+- Don't add telemetry, don't call external services.
+- Don't commit or push unless the user explicitly asks.

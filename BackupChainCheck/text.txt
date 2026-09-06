@@ -1,0 +1,6 @@
+You're a good DBA, using Ola's maintenance solution ( https://ola.hallengren.com/ )
+and you think you have everying covered. 
+Than management asks you to restore a database and suddenly the LSN backup chain is inalid.
+Instead of being fired you have used this script to validate the @CleanupTime.
+
+Here it is.. 

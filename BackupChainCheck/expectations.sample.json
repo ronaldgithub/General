@@ -1,0 +1,23 @@
+{
+  "_comment": "Expected retention/cadence for BackupChainCheck when not connecting to SQL Server. Copy to expectations.json and edit. All values are hours. Any key may be omitted.",
+
+  "defaults": {
+    "FullCleanupTimeHours": 72,
+    "DiffCleanupTimeHours": 48,
+    "LogCleanupTimeHours": 72,
+
+    "FullIntervalHours": 24,
+    "DiffIntervalHours": 6,
+    "LogIntervalHours": 1
+  },
+
+  "databases": {
+    "Finance": {
+      "LogCleanupTimeHours": 168,
+      "LogIntervalHours": 0.25
+    },
+    "Staging": {
+      "FullIntervalHours": 168
+    }
+  }
+}
