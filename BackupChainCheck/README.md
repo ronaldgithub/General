@@ -104,6 +104,8 @@ The tool **never writes to SQL Server and never deletes or modifies backup files
 ```powershell
 # Reconcile against a live instance. Reads the DatabaseBackup job steps, sys.databases,
 # and dbo.CommandLog (Ola's run log). -SolutionDatabase defaults to master.
+.\Invoke-BackupChainCheck.ps1 -SqlInstance 'win11' -SolutionDatabase 'master' -BackupPath 'E:\backups\win11'
+
 .\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' -BackupPath '\\nas01\sqlbackup'
 
 # Solution installed in a dedicated DBA database
