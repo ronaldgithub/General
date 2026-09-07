@@ -10,8 +10,10 @@ against the backup files actually present on disk, and reports recovery-coverage
 gaps. See `README.md` for the functional design and the reconciliation math.
 
 Core rule: **the tool must never write to SQL Server and never delete or modify
-backup files.** Every SQL query is read-only against `msdb`. Every filesystem
-operation is enumeration only.
+backup files.** Every SQL query is a read-only `SELECT` against `msdb`,
+`sys.databases` / `master`, and `<SolutionDatabase>.dbo.CommandLog`. No
+`RESTORE`, not even `VERIFYONLY` (verify results are read from `CommandLog`).
+Every filesystem operation is enumeration only.
 
 ## Runtime target: Windows PowerShell 5.1 only
 
@@ -94,6 +96,8 @@ Internal structure of the script, in order:
   tests drive with stand-in rows. LSN/bool marshalling helpers:
   `ConvertTo-LsnDecimal`, `ConvertTo-NullableBool`.
 - `Get-SqlDatabaseInfo` — `sys.databases` recovery model / state / last backup.
+  Main then drops databases that are not present + ONLINE here (stale
+  `CommandLog` / orphaned files) unless `-IncludeOfflineDatabases`.
 - `Expand-DatabaseScope` — Ola `@Databases` token → concrete database list.
 - `Get-ExpectationModel` — layers interval (files → CommandLog → SQL Agent
   schedule → config → params) and retention (config defaults → job → config
@@ -121,6 +125,14 @@ Internal structure of the script, in order:
 - `Test-DatabaseMatch` — `-Database` wildcard filter (`-like`, `*` = all).
 - `Write-HtmlReport`.
 
+`#region Main`, in order: load config → scan files → (`-SqlInstance`) read job
+config, schedule, `CommandLog`, backup history → drop non-ONLINE / dropped
+databases unless `-IncludeOfflineDatabases` → apply `-Database` scope →
+`Get-ExpectationModel` → `Test-BackupChain` → `Join-BackupSetToFile` (annotate
+history once) → `Test-LsnChain` → merge findings → `Get-RunSummary` +
+console/`-Predict`/`-Graph` output → HTML report → emit pipeline objects
+(predictions under `-Predict`, else findings) → `-FailOnGap` exit code.
+
 **A future module split** (`BackupChainCheck.psd1` + `.psm1` + `src/` with one
 public function per file, `docs/ola-conventions.md`) is fine to do later, but keep
 the single-script entry point working — it is what the README documents.
@@ -131,6 +143,11 @@ the single-script entry point working — it is what the README documents.
   comment-based help, typed + validated parameters, pipeline-friendly.
 - Emit **objects, not text**. No `Write-Host` for data; use `Write-Verbose`,
   `Write-Warning`, `Write-Error` for diagnostics and the pipeline for results.
+  The exception is the deliberate human-facing console views — `Get-RunSummary`,
+  `Write-PredictionMatrix`, `Write-ChainGraph`, the findings table — which
+  `Write-Host` under `-not $Quiet` *in addition to* the pipeline objects, never
+  instead of them. `BackupChainCheck.Format.ps1xml` gives the pipeline objects
+  their default table view.
 - Findings are `[pscustomobject]` with a stable shape:
   `Instance, Database, BackupType, Severity ('Error'|'Warning'|'Info'), Finding, Expected, Found, Detail`.
 - SQL access is plain ADO.NET (`System.Data.SqlClient`) via `Invoke-SqlQuery`.

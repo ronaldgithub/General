@@ -4,15 +4,18 @@ A read-only Windows PowerShell 5.1 tool that checks whether the SQL Server backu
 files produced by [Ola Hallengren's Maintenance Solution](https://ola.hallengren.com/)
 actually add up to the recovery coverage you think you have.
 
-It does this by **reconciling three things that are normally never compared**:
+It does this by **reconciling things that are normally never compared**:
 
 1. **Retention** – the `@CleanupTime` value (in hours) and other backup settings
    configured in the `DatabaseBackup` Agent job steps (or supplied via a config file).
 2. **Cadence** – how often each backup type is scheduled to run (read from SQL Agent
-   schedules, from `msdb.dbo.backupset` history, or inferred from file timestamps).
+   schedules, from `dbo.CommandLog`, or inferred from file timestamps).
 3. **Reality** – the backup files that are actually present on the backup path(s).
+4. **The LSN chain** – whether `msdb`'s recorded log-backup chain is actually
+   continuous and every link's file is still on disk, i.e. whether a point-in-time
+   restore would really work.
 
-When those three disagree, you have a gap.
+When those disagree, you have a gap — and the tool tells you which kind.
 
 ---
 
@@ -66,6 +69,8 @@ databases so you can tell which case it is.
   equals the previous `last_lsn` (contiguous, one recovery fork), no `is_damaged`
   backup, and no LOG recorded in `msdb` inside the on-disk chain window whose file
   has gone missing. Reported as the `LSN valid` / `error` headline plus findings.
+- **DIFF base** (`-SqlInstance`) – each retained differential's
+  `differential_base_lsn` matches a FULL that is still in the history window.
 - **Roll-forward coverage** – the oldest retained FULL has a LOG chain starting at
   or before it. `@CleanupTime` for LOG shorter than for FULL leaves your *oldest*
   full backups unrecoverable-forward.
@@ -297,7 +302,7 @@ The timestamp in the file name is used as the backup time; `@NumberOfFiles > 1`
 | `Invoke-BackupChainCheck.ps1` | The tool. Single self-contained script. |
 | `BackupChainCheck.Format.ps1xml` | Default table views for the emitted objects (loaded automatically; optional). |
 | `expectations.sample.json` | Template for `-ConfigPath`. |
-| `tests/Invoke-BackupChainCheck.Tests.ps1` | Pester tests for the parsing / math functions. |
+| `tests/Invoke-BackupChainCheck.Tests.ps1` | Pester tests for the pure functions (parsing, schedule math, LSN chain, prediction) — no SQL. |
 | `CLAUDE.md` | Repo conventions and design notes. |
 
 ## Tests
@@ -310,10 +315,22 @@ Written for the in-box Pester 3.4; also runs on 4.x / 5.x. No SQL Server needed.
 
 ## Status
 
-Working. Filesystem reconciliation, config-file and `-SqlInstance` inputs,
-`dbo.CommandLog` failure detection, HTML report and monitoring exit codes are all
-implemented and covered by a smoke test. A future split into a proper module
-(`src/`, `BackupChainCheck.psd1`) is described in `CLAUDE.md` but not done yet.
+Working. Implemented and covered by the Pester suite:
+
+- filesystem reconciliation; config-file, `-SqlInstance` and parameter inputs;
+- SQL Agent schedule reading for the intended cadence, ahead of `dbo.CommandLog`
+  and file-spacing inference;
+- LSN chain validation from `msdb` history, cross-checked against the files on
+  disk (`LSN valid` / `error` headline);
+- `dbo.CommandLog` failure detection; ONLINE-only database scoping; `-Database`
+  wildcard filter;
+- `-Predict` (present-vs-expected matrix) and `-Graph` (ASCII chain timeline)
+  console views;
+- HTML report and `-FailOnGap` monitoring exit codes.
+
+A future split into a proper module (`src/`, `BackupChainCheck.psd1`) is described
+in `CLAUDE.md` but not done yet — the single-script entry point is what this
+README documents.
 
 ## License
 
