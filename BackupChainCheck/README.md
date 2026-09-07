@@ -126,9 +126,9 @@ The tool **never writes to SQL Server and never deletes or modifies backup files
     -BackupPath 'D:\Backup','\\nas01\sqlbackup' `
     -ReportPath '.\report.html' -FailOnGap
 
-# One database, and show the predicted-vs-actual file matrix
+# One database, predicted-vs-actual matrix + ASCII chain timeline
 .\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' -BackupPath 'D:\Backup' `
-    -Database 'Finance' -Predict
+    -Database 'Finance' -Predict -Graph
 ```
 
 `-Database` takes one or more `-like` wildcard patterns (default `*` = every
@@ -168,6 +168,26 @@ pipeline (each with a `.Slots` array of every projected slot, its age and
 With `-SqlInstance` the projected slot times come from the **SQL Agent schedule**
 on the DatabaseBackup jobs (`daily at 18:00`, `every 1 hour`, …), so "missing
 slots" line up with the times the backup was actually supposed to run.
+
+### `-Graph` — the chain, drawn
+
+`-Graph` prints an ASCII timeline per `(database, type)`:
+
+```
+Backup chain timeline  (-Graph)
+  | backup present   X recorded in msdb, file missing   ~~[d]~~ idle gap   //gap// LSN break   //fork// recovery fork
+
+StackOverflow2010
+  FULL | ~~[6d 14h 37m]~~ |-|-|--> now
+    2026-08-31 18:01 -> 2026-09-07 08:38  6d 14h 37m, no FULL backups
+  LOG  |-|-|-|-|-|-|-X-|-|-|-|-|-| ~~[11h 00m]~~ | ~~[5d 23h 46m]~~ |-|-|-|--> now
+    2026-08-31 16:00  file missing on disk (recorded in msdb) - restore stops here
+    2026-09-01 09:00 -> 2026-09-07 08:46  5d 23h 46m, no LOG backups
+```
+
+Each `|` is a backup; `X` is one that `msdb` recorded but whose file is gone;
+`~~[…]~~` is an idle stretch; `//gap//` an LSN break; `//fork//` a recovery-fork
+change. Console only — the pipeline is unchanged.
 
 When no retention is supplied (no `-SqlInstance`, no `-ConfigPath`, no
 `-*CleanupTimeHours`), the tool still infers cadence from file spacing and reports

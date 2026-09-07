@@ -109,6 +109,9 @@ Internal structure of the script, in order:
   own file is gone). Time gaps are deliberately NOT breaks. Returns
   `@{ Status = 'valid'|'error'|'n/a'; Findings }`; `Status` is the first column
   of the `Get-RunSummary` line (green / red / dark-yellow on the console).
+- `Write-ChainGraph` — the `-Graph` mode: an ASCII timeline per (database, type)
+  from the annotated history (or files), `|` per backup, `X` for a missing file,
+  `~~[dur]~~` / `//gap//` / `//fork//` between. LSN-break markers are LOG-only.
 - `Get-BackupPrediction` / `Write-PredictionMatrix` — the `-Predict` mode.
   `Get-BackupPrediction` projects, per (database, type) with a known retention +
   interval, the backup slots that should be on disk now (one every interval, back

@@ -105,6 +105,12 @@
     on the pipeline (each with a .Slots breakdown). The findings table still
     prints to the host; -FailOnGap still uses the findings.
 
+.PARAMETER Graph
+    Draw an ASCII timeline of each database's backup chain - one row per
+    (database, type) with 'o' for a backup present, 'X' for one recorded in msdb
+    whose file is gone, and inline markers where the chain has an idle gap, an
+    LSN break or a recovery-fork change. Console only; the pipeline is unchanged.
+
 .PARAMETER Quiet
     Suppress the console table (the pipeline objects are still returned).
 
@@ -162,6 +168,8 @@ param(
     [switch]$FailOnGap,
 
     [switch]$Predict,
+
+    [switch]$Graph,
 
     [switch]$Quiet
 )
@@ -1718,6 +1726,117 @@ function Write-PredictionMatrix {
     }
 }
 
+function Write-ChainGraph {
+    <#
+        ASCII timeline of each database's backup chain, one row per (database,
+        type): 'o' for a backup present, 'X' for one recorded in msdb whose file
+        is gone, and inline gap markers - ~~[dur]~~ for an idle stretch,
+        //gap// for an LSN break, //fork// for a recovery-fork change. Uses msdb
+        history (with on-disk status) when available, otherwise the files alone.
+    #>
+    param(
+        [object[]]$History = @(),
+        [object[]]$LogicalBackup = @(),
+        [hashtable]$Model,
+        [datetime]$Now = $script:Now,
+        [double]$ToleranceFactor = 1.5
+    )
+
+    $histByDb = @{}
+    foreach ($h in $History) {
+        if (-not $histByDb.ContainsKey($h.Database)) { $histByDb[$h.Database] = New-Object System.Collections.Generic.List[object] }
+        $histByDb[$h.Database].Add($h)
+    }
+    $fileByDb = @{}
+    foreach ($lb in $LogicalBackup) {
+        if (-not $fileByDb.ContainsKey($lb.Database)) { $fileByDb[$lb.Database] = New-Object System.Collections.Generic.List[object] }
+        $fileByDb[$lb.Database].Add($lb)
+    }
+
+    $dbs = @(@($histByDb.Keys) + @($fileByDb.Keys) | Sort-Object -Unique)
+    if ($dbs.Count -eq 0) { Write-Host 'No backups to graph.'; return }
+
+    Write-Host ''
+    Write-Host 'Backup chain timeline  (-Graph)'
+    Write-Host "  | backup present   X recorded in msdb, file missing   ~~[d]~~ idle gap   //gap// LSN break   //fork// recovery fork"
+
+    foreach ($db in $dbs) {
+        Write-Host ''
+        Write-Host $db
+        foreach ($type in $script:BackupTypes) {
+            $usingHistory = $histByDb.ContainsKey($db) -and @($histByDb[$db] | Where-Object { $_.BackupType -eq $type -and -not $_.IsCopyOnly }).Count -gt 0
+            if ($usingHistory) {
+                $chain = @($histByDb[$db] | Where-Object { $_.BackupType -eq $type -and -not $_.IsCopyOnly } | Sort-Object Timestamp)
+            }
+            elseif ($fileByDb.ContainsKey($db)) {
+                $chain = @($fileByDb[$db] | Where-Object { $_.BackupType -eq $type -and -not $_.IsCopyOnly } | Sort-Object Timestamp)
+            }
+            else { $chain = @() }
+            if ($chain.Count -eq 0) { continue }
+
+            $interval = $null
+            if ($Model -and $Model.ContainsKey($db)) { $interval = $Model[$db][$type].IntervalHours }
+            $gapH = if ($interval -and $interval -gt 0) { $interval * $ToleranceFactor } elseif ($type -eq 'LOG') { 2.0 } else { 30.0 }
+
+            $line = New-Object System.Text.StringBuilder
+            $notes = New-Object System.Collections.Generic.List[string]
+
+            for ($i = 0; $i -lt $chain.Count; $i++) {
+                $r = $chain[$i]
+                $missing = $usingHistory -and $r.PSObject.Properties['OnDisk'] -and $r.OnDisk -eq $false
+
+                if ($i -gt 0) {
+                    $prev = $chain[$i - 1]
+                    $span = ($r.Timestamp - $prev.Timestamp).TotalHours
+                    # LSN continuity is only a thing for the LOG chain - each FULL / DIFF
+                    # starts a long way past the previous one's last_lsn by design.
+                    $forkBreak = $type -eq 'LOG' -and $usingHistory -and $prev.PSObject.Properties['ForkGuid'] -and $r.ForkGuid -and $prev.ForkGuid -and $prev.ForkGuid -ne $r.ForkGuid
+                    $lsnBreak = $type -eq 'LOG' -and $usingHistory -and $null -ne $prev.LastLsn -and $null -ne $r.FirstLsn -and $r.FirstLsn -gt $prev.LastLsn
+
+                    if ($forkBreak) {
+                        [void]$line.Append(' //fork// ')
+                        $notes.Add(('    {0:yyyy-MM-dd HH:mm}  recovery fork changed - chain broken here' -f $r.Timestamp))
+                    }
+                    elseif ($lsnBreak) {
+                        [void]$line.Append(' //gap// ')
+                        $notes.Add(('    {0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm}  LSN break - a backup is missing from msdb' -f $prev.Timestamp, $r.Timestamp))
+                    }
+                    elseif ($span -gt $gapH) {
+                        [void]$line.Append((' ~~[{0}]~~ ' -f (Get-DurationText $span)))
+                        $notes.Add(('    {0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm}  {2}, no {3} backups' -f $prev.Timestamp, $r.Timestamp, (Get-DurationText $span), $type))
+                    }
+                    else {
+                        [void]$line.Append('-')
+                    }
+                }
+
+                if ($missing) {
+                    [void]$line.Append('X')
+                    $notes.Add(('    {0:yyyy-MM-dd HH:mm}  file missing on disk (recorded in msdb) - restore stops here' -f $r.Timestamp))
+                }
+                else {
+                    [void]$line.Append('|')
+                }
+            }
+
+            $tail = ($Now - $chain[$chain.Count - 1].Timestamp).TotalHours
+            if ($tail -gt $gapH) { [void]$line.Append((' ~~[{0}]~~> now' -f (Get-DurationText $tail))) }
+            else { [void]$line.Append('--> now') }
+
+            # Collapse long contiguous runs so a busy chain stays one line.
+            $rendered = [regex]::Replace($line.ToString(), '(?:\|-){8,}\|', {
+                    param($m)
+                    $n = ([regex]::Matches($m.Value, '\|')).Count
+                    "|-|-|..($n)..|-|-|"
+                })
+
+            Write-Host ('  {0,-4} {1}' -f $type, $rendered)
+            foreach ($n in ($notes | Select-Object -Unique)) { Write-Host $n }
+        }
+    }
+    Write-Host ''
+}
+
 #endregion
 
 #region HTML report --------------------------------------------------------
@@ -1903,6 +2022,10 @@ if ($logical.Count -eq 0) {
 
 $findings = Test-BackupChain -LogicalBackup $logical -Model $model -DatabaseInfo $dbInfo -CommandLog $commandLog -ToleranceFactor $GapToleranceFactor
 
+# Annotate history with on-disk status once, up front (Test-LsnChain and
+# Write-ChainGraph both use it).
+if ($backupHistory.Count -gt 0) { $backupHistory = @(Join-BackupSetToFile -History $backupHistory -LogicalBackup $logical) }
+
 $lsn = Test-LsnChain -History $backupHistory -LogicalBackup $logical -DatabaseInfo $dbInfo
 Write-Verbose "LSN chain status: $($lsn.Status) ($($lsn.Findings.Count) finding(s))."
 if ($lsn.Findings.Count -gt 0) { $findings = @($findings) + @($lsn.Findings) }
@@ -1936,6 +2059,10 @@ $prediction = $null
 if ($Predict) {
     $prediction = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -ToleranceFactor $GapToleranceFactor)
     if (-not $Quiet) { Write-PredictionMatrix -Prediction $prediction }
+}
+
+if ($Graph -and -not $Quiet) {
+    Write-ChainGraph -History $backupHistory -LogicalBackup $logical -Model $model -ToleranceFactor $GapToleranceFactor
 }
 
 # Emit objects on the pipeline: the prediction records under -Predict, otherwise
