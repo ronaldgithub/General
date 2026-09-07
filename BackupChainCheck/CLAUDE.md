@@ -58,27 +58,60 @@ Invoke-BackupChainCheck.ps1              The whole tool. param() block, helper
                                          Returns early when dot-sourced
                                          (InvocationName -eq '.') so tests can
                                          load the functions without running it.
+BackupChainCheck.Format.ps1xml           Default TableControl views for the emitted
+                                         BackupChainCheck.Finding / .Prediction
+                                         objects. Loaded via Update-FormatData at
+                                         script start (guarded - the script still
+                                         works if it is missing). Optional polish,
+                                         not a second code file.
 expectations.sample.json                 Template for -ConfigPath.
 tests/Invoke-BackupChainCheck.Tests.ps1  Pester tests (parsing + math), no SQL.
 ```
 
 Internal structure of the script, in order:
 
-- `New-Finding` / `Get-DurationText` / `Get-Median` — small helpers.
+- `New-Finding` (tags output `BackupChainCheck.Finding`) / `Get-DurationText` /
+  `Get-Median` / `Get-RunSummary` (the one-line header) — small helpers.
 - `ConvertFrom-OlaBackupFile` — one FileInfo (or stand-in) → parsed record.
   Directory structure trusted first, file name is the fallback.
 - `Get-BackupFileInventory` / `Group-LogicalBackup` — scan + collapse striping.
 - `Invoke-SqlQuery` — thin read-only ADO.NET helper.
 - `Get-OlaJobConfig` — regex `@CleanupTime` / `@CleanupMode` / `@NumberOfFiles` /
   `@BackupType` / `@Databases` / `@Directory` out of `msdb.dbo.sysjobsteps`.
+- `Get-OlaJobSchedule` — the SQL Agent schedule(s) on each DatabaseBackup job
+  (`sysschedules` + `sysjobschedules`), turned into an intended interval + text +
+  next-run time per (backup type, scope). `ConvertTo-ScheduleInterval` /
+  `ConvertFrom-AgentTime` do the `freq_*` decoding (pure, tested).
 - `Get-OlaCommandLog` — `BACKUP_DATABASE` / `BACKUP_LOG` rows from
-  `<SolutionDatabase>.dbo.CommandLog`; returns `$null` if the table is absent.
+  `<SolutionDatabase>.dbo.CommandLog`; returns `$null` if the table is absent,
+  otherwise a plain array (never a `-NoEnumerate` `List` — that trips an ETS
+  binder bug in the caller's `@(...)`).
+- `Get-BackupSetHistory` / `Group-BackupSetRow` — `msdb.dbo.backupset` +
+  `backupmediafamily` + `backupmediaset` for D/I/L backups, one record per
+  logical backup with its LSN chain fields (`FirstLsn` … `DifferentialBaseLsn`,
+  kept as `[decimal]` — never `[double]`), recovery-fork guids, damage/verify
+  flags and stripe device paths. `Group-BackupSetRow` is the pure shaper the
+  tests drive with stand-in rows. LSN/bool marshalling helpers:
+  `ConvertTo-LsnDecimal`, `ConvertTo-NullableBool`.
 - `Get-SqlDatabaseInfo` — `sys.databases` recovery model / state / last backup.
 - `Expand-DatabaseScope` — Ola `@Databases` token → concrete database list.
-- `Get-ExpectationModel` — layers interval (files → CommandLog → config → params)
-  and retention (config defaults → job → config per-db → params) into
-  `$model[db][type]`.
-- `Test-BackupChain` — every check; emits `New-Finding` objects.
+- `Get-ExpectationModel` — layers interval (files → CommandLog → SQL Agent
+  schedule → config → params) and retention (config defaults → job → config
+  per-db → params) into `$model[db][type]` (also carries `ScheduleText` /
+  `NextRun` when a schedule set the interval).
+- `Test-BackupChain` — the file/retention/cadence checks; emits `New-Finding`.
+- `Test-LsnChain` — LSN continuity of the LOG chain from `Get-BackupSetHistory`
+  (each LOG `first_lsn` = previous `last_lsn`, one recovery fork, nothing
+  `is_damaged`, DIFF bases present). Time gaps are deliberately NOT breaks.
+  Returns `@{ Status = 'valid'|'error'|'n/a'; Findings }`; `Status` is the first
+  column of the `Get-RunSummary` line.
+- `Get-BackupPrediction` / `Write-PredictionMatrix` — the `-Predict` mode.
+  `Get-BackupPrediction` projects, per (database, type) with a known retention +
+  interval, the backup slots that should be on disk now (one every interval, back
+  to age `Cleanup + Interval`), greedily matches each to the closest unclaimed
+  actual within half an interval, and emits a `BackupChainCheck.Prediction`
+  record with a `.Slots` breakdown. Pure; takes `-Now` for testability.
+- `Test-DatabaseMatch` — `-Database` wildcard filter (`-like`, `*` = all).
 - `Write-HtmlReport`.
 
 **A future module split** (`BackupChainCheck.psd1` + `.psm1` + `src/` with one

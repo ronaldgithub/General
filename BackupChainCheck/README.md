@@ -121,20 +121,76 @@ The tool **never writes to SQL Server and never deletes or modifies backup files
 .\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' `
     -BackupPath 'D:\Backup','\\nas01\sqlbackup' `
     -ReportPath '.\report.html' -FailOnGap
+
+# One database, and show the predicted-vs-actual file matrix
+.\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' -BackupPath 'D:\Backup' `
+    -Database 'Finance' -Predict
 ```
+
+`-Database` takes one or more `-like` wildcard patterns (default `*` = every
+database) and scopes the whole analysis, not just the printed table.
+
+### `-Predict` — what *should* be on disk
+
+`-Predict` turns the retention math around: for every in-scope `(database, backup
+type)` with a known retention and cadence it projects the set of backup files
+that should be present right now — one slot every `IntervalHours`, back to age
+`CleanupTime + IntervalHours` — and matches each slot to a real file.
+
+```
+Predicted backups on disk now  -  present / expected   (-Predict)
+
+Database   FULL  DIFF  LOG
+--------   ----  ----  ---
+Finance    3/3   4/4   2/49
+Sales      1/3   0/1   47/49
+
+Finance / LOG  -  interval 1h 00m, retention 2d 0h 00m (AFTER_BACKUP), 1 file(s)/backup
+   expected 49, present 2, missing 47, off-schedule 1
+   missing slots: 2026-09-07 08:00, 2026-09-07 07:00, 2026-09-07 06:00, ... (+44 more)
+```
+
+It emits one `BackupChainCheck.Prediction` object per `(database, type)` on the
+pipeline (each with a `.Slots` array of every projected slot, its age and
+`present` / `partial` / `missing` status, plus `Schedule`, `NextScheduledRun` and
+`IntervalSource`). The findings table still prints to the console, and
+`-FailOnGap` still works off the findings.
+
+With `-SqlInstance` the projected slot times come from the **SQL Agent schedule**
+on the DatabaseBackup jobs (`daily at 18:00`, `every 1 hour`, …), so "missing
+slots" line up with the times the backup was actually supposed to run.
 
 When no retention is supplied (no `-SqlInstance`, no `-ConfigPath`, no
 `-*CleanupTimeHours`), the tool still infers cadence from file spacing and reports
 chain gaps, striping problems and coverage — it just cannot evaluate the
 count-vs-retention check and says so.
 
-Cadence, when not given explicitly, is taken from `dbo.CommandLog` run times if
-available, otherwise from the spacing of the files on disk.
+Cadence, when not given explicitly, is taken from the SQL Agent schedule on the
+DatabaseBackup jobs, then `dbo.CommandLog` run times, then the spacing of the
+files on disk — in that order of preference. A `-*IntervalHours` parameter or a
+config-file value overrides all of them.
 
 ### Output
 
-Each finding is emitted as a `[pscustomobject]` on the pipeline so you can filter,
-export, or feed it into monitoring:
+The console output opens with a one-line summary — the **LSN chain verdict**, run
+time, scope, `@CleanupTime` for FULL / DIFF / LOG (a range when it differs across
+databases, `?` when unknown), the count of FULL / DIFF / LOG files found, and the
+finding tally:
+
+```
+LSN valid  |  BackupChainCheck 2026-09-07 10:30  |  StackOverflow2010  |  @CleanupTime F/D/L 48/48/48h  |  files F/D/L 3/2/18  |  3E 4W 0I
+```
+
+`LSN valid` / `error` / `n/a` comes from `Test-LsnChain`: with `-SqlInstance` it
+reads `msdb` history and checks that each LOG backup's `first_lsn` equals the
+previous one's `last_lsn` (a contiguous chain on one recovery fork), and that no
+backup is `is_damaged`. **Time gaps are not a break** — a database can sit idle
+for days with a perfectly intact chain, which is why this can read `valid` even
+when the file-spacing check reports "LOG chain gap". `n/a` means there was no
+`msdb` history to check (no `-SqlInstance`, or no LOG backups in the window).
+
+Each finding is then emitted as a `[pscustomobject]` on the pipeline so you can
+filter, export, or feed it into monitoring:
 
 ```
 Severity Database      BackupType Finding                                                 Expected  Found
@@ -202,6 +258,7 @@ The timestamp in the file name is used as the backup time; `@NumberOfFiles > 1`
 | File | Purpose |
 |------|---------|
 | `Invoke-BackupChainCheck.ps1` | The tool. Single self-contained script. |
+| `BackupChainCheck.Format.ps1xml` | Default table views for the emitted objects (loaded automatically; optional). |
 | `expectations.sample.json` | Template for `-ConfigPath`. |
 | `tests/Invoke-BackupChainCheck.Tests.ps1` | Pester tests for the parsing / math functions. |
 | `CLAUDE.md` | Repo conventions and design notes. |

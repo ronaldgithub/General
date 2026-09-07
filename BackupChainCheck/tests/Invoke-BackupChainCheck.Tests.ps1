@@ -34,6 +34,103 @@ Describe 'Get-DurationText' {
     }
 }
 
+Describe 'Test-DatabaseMatch' {
+    It 'matches everything against *' {
+        Test-DatabaseMatch -Name 'AnyDb' -Pattern '*' | Should Be $true
+    }
+    It 'matches an exact name' {
+        Test-DatabaseMatch -Name 'StackOverflow2010' -Pattern @('StackOverflow2010') | Should Be $true
+    }
+    It 'honours wildcards and a pattern list' {
+        Test-DatabaseMatch -Name 'JDE_PRODUCTION' -Pattern @('ODS', 'JDE_*') | Should Be $true
+    }
+    It 'returns $false when nothing matches' {
+        Test-DatabaseMatch -Name 'Sales' -Pattern @('Finance', 'HR*') | Should Be $false
+    }
+}
+
+Describe 'ConvertFrom-AgentTime' {
+    It 'decodes HHMMSS to HH:mm' {
+        ConvertFrom-AgentTime 180000 | Should Be '18:00'
+        ConvertFrom-AgentTime 123000 | Should Be '12:30'
+        ConvertFrom-AgentTime 0 | Should Be '00:00'
+    }
+}
+
+Describe 'ConvertTo-ScheduleInterval' {
+    It 'reads a daily-at-a-time schedule as 24h' {
+        $r = ConvertTo-ScheduleInterval -FreqType 4 -FreqInterval 1 -FreqSubdayType 1 -FreqSubdayInterval 0 -ActiveStartTime 180000
+        $r.IntervalHours | Should Be 24
+        $r.Text | Should Be 'daily at 18:00'
+    }
+    It 'reads an hourly sub-day schedule as 1h' {
+        $r = ConvertTo-ScheduleInterval -FreqType 4 -FreqInterval 1 -FreqSubdayType 8 -FreqSubdayInterval 1
+        $r.IntervalHours | Should Be 1
+        $r.Text | Should Be 'every 1 hour'
+    }
+    It 'reads an every-15-minutes schedule as 0.25h' {
+        $r = ConvertTo-ScheduleInterval -FreqType 4 -FreqInterval 1 -FreqSubdayType 4 -FreqSubdayInterval 15
+        $r.IntervalHours | Should Be 0.25
+    }
+    It 'averages a weekly schedule with two days a week' {
+        # freq_interval bitmask: Sunday(1) + Wednesday(8) = 9
+        $r = ConvertTo-ScheduleInterval -FreqType 8 -FreqInterval 9 -FreqSubdayType 1 -FreqSubdayInterval 0 -FreqRecurrenceFactor 1 -ActiveStartTime 20000
+        $r.IntervalHours | Should Be 84
+    }
+    It 'returns $null hours for a one-time schedule' {
+        $r = ConvertTo-ScheduleInterval -FreqType 1 -FreqInterval 0 -FreqSubdayType 1 -FreqSubdayInterval 0
+        $r.IntervalHours | Should Be $null
+    }
+}
+
+Describe 'Get-RunSummary' {
+    $model = @{
+        'DB1' = @{
+            FULL = ([ordered]@{ CleanupHours = 72; IntervalHours = 24; NumberOfFiles = 1; CleanupMode = 'AFTER_BACKUP'; Source = @() })
+            DIFF = ([ordered]@{ CleanupHours = 48; IntervalHours = 24; NumberOfFiles = 1; CleanupMode = 'AFTER_BACKUP'; Source = @() })
+            LOG  = ([ordered]@{ CleanupHours = $null; IntervalHours = 1; NumberOfFiles = 1; CleanupMode = 'AFTER_BACKUP'; Source = @() })
+        }
+    }
+    $logical = @(
+        [pscustomobject]@{ Database = 'DB1'; BackupType = 'FULL' },
+        [pscustomobject]@{ Database = 'DB1'; BackupType = 'LOG' },
+        [pscustomobject]@{ Database = 'DB1'; BackupType = 'LOG' }
+    )
+    $findings = @(
+        [pscustomobject]@{ Severity = 'Error' },
+        [pscustomobject]@{ Severity = 'Warning' }
+    )
+    $line = Get-RunSummary -Now ([datetime]'2026-09-07 10:20:00') -Logical $logical -Model $model -Finding $findings -LsnStatus 'valid'
+
+    It 'leads with the LSN status column, then the tool name and run time' {
+        ($line -like 'LSN valid  |  BackupChainCheck 2026-09-07 10:20*') | Should Be $true
+    }
+    It 'defaults the LSN status to n/a' {
+        ((Get-RunSummary -Now ([datetime]'2026-09-07 10:20:00') -Model $model) -like 'LSN n/a *') | Should Be $true
+    }
+    It 'shows the single database as the scope' {
+        ($line -like '*  DB1  *') | Should Be $true
+    }
+    It 'shows @CleanupTime per type, ? when unknown' {
+        ($line -like '*@CleanupTime F/D/L 72/48/?h*') | Should Be $true
+    }
+    It 'shows the file counts per type' {
+        ($line -like '*files F/D/L 1/0/2*') | Should Be $true
+    }
+    It 'shows the finding tally' {
+        ($line -like '*1E 1W 0I') | Should Be $true
+    }
+    It 'summarises many databases as a count with a cleanup range' {
+        $m2 = @{
+            'A' = @{ FULL = ([ordered]@{ CleanupHours = 48 }); DIFF = ([ordered]@{ CleanupHours = $null }); LOG = ([ordered]@{ CleanupHours = $null }) }
+            'B' = @{ FULL = ([ordered]@{ CleanupHours = 168 }); DIFF = ([ordered]@{ CleanupHours = $null }); LOG = ([ordered]@{ CleanupHours = $null }) }
+        }
+        $l2 = Get-RunSummary -Now ([datetime]'2026-09-07 10:20:00') -Model $m2
+        ($l2 -like '*2 databases*') | Should Be $true
+        ($l2 -like '*F/D/L 48-168/?/?h*') | Should Be $true
+    }
+}
+
 Describe 'Get-Median' {
     It 'returns the middle value for an odd count' {
         Get-Median -Value @(1, 5, 2) | Should Be 2
@@ -76,6 +173,231 @@ Describe 'ConvertFrom-OlaBackupFile - tokens and striping' {
     It 'returns $null for a non-backup file' {
         $f = New-FileInfoLike 'D:\B\notes.txt'
         ConvertFrom-OlaBackupFile -File $f | Should Be $null
+    }
+}
+
+Describe 'ConvertTo-LsnDecimal' {
+    It 'keeps a 25-digit LSN lossless (no double rounding)' {
+        ConvertTo-LsnDecimal '9999999999999999999999999' |
+            Should Be ([decimal]'9999999999999999999999999')
+    }
+    It 'returns $null for DBNull' {
+        ConvertTo-LsnDecimal ([System.DBNull]::Value) | Should Be $null
+    }
+    It 'returns $null for $null' {
+        ConvertTo-LsnDecimal $null | Should Be $null
+    }
+}
+
+Describe 'ConvertTo-NullableBool' {
+    It 'treats DBNull as $false' {
+        ConvertTo-NullableBool ([System.DBNull]::Value) | Should Be $false
+    }
+    It 'passes a real bit through' {
+        ConvertTo-NullableBool 1 | Should Be $true
+    }
+}
+
+Describe 'Group-BackupSetRow' {
+    function New-BackupRowLike {
+        param(
+            [int]$SetId, [string]$Type = 'D', [string]$Db = 'DB1',
+            [string]$Device = 'E:\b\DB1\FULL\DB1_FULL_20260907_083848.bak',
+            $DiffBaseLsn = ([System.DBNull]::Value),
+            $FinishDate = ([datetime]'2026-09-07 08:39:00')
+        )
+        [pscustomobject]@{
+            backup_set_id            = $SetId
+            database_name            = $Db
+            server_name              = 'WIN10'
+            type                     = $Type
+            backup_start_date        = [datetime]'2026-09-07 08:38:48'
+            backup_finish_date       = $FinishDate
+            first_lsn                = [decimal]'661000017516200011'
+            last_lsn                 = [decimal]'661000017516900001'
+            checkpoint_lsn           = [decimal]'661000012988400040'
+            database_backup_lsn      = [decimal]'661000012988400040'
+            differential_base_lsn    = $DiffBaseLsn
+            first_recovery_fork_guid = 'AAAAAAAA-0000-0000-0000-000000000001'
+            last_recovery_fork_guid  = 'AAAAAAAA-0000-0000-0000-000000000001'
+            is_copy_only             = $false
+            is_damaged               = $false
+            has_backup_checksums     = $true
+            begins_log_chain         = $false
+            recovery_model           = 'FULL'
+            user_name                = 'NT SERVICE\SQLSERVERAGENT'
+            software_name            = 'Microsoft SQL Server'
+            physical_device_name     = $Device
+            family_sequence_number   = 1
+        }
+    }
+
+    It 'maps D/I/L to FULL/DIFF/LOG' {
+        (Group-BackupSetRow -Row @(New-BackupRowLike -SetId 1 -Type 'D')).BackupType | Should Be 'FULL'
+        (Group-BackupSetRow -Row @(New-BackupRowLike -SetId 2 -Type 'I')).BackupType | Should Be 'DIFF'
+        (Group-BackupSetRow -Row @(New-BackupRowLike -SetId 3 -Type 'L')).BackupType | Should Be 'LOG'
+    }
+
+    It 'skips backup types other than D/I/L' {
+        Group-BackupSetRow -Row @(New-BackupRowLike -SetId 4 -Type 'F') | Should Be $null
+    }
+
+    It 'collapses striped media families into one record with all device paths' {
+        $rows = @(
+            (New-BackupRowLike -SetId 10 -Device 'E:\b\DB1_1.bak'),
+            (New-BackupRowLike -SetId 10 -Device 'E:\b\DB1_2.bak')
+        )
+        $rec = @(Group-BackupSetRow -Row $rows)
+        $rec.Count | Should Be 1
+        $rec[0].DeviceCount | Should Be 2
+    }
+
+    It 'exposes LSNs as decimal, DBNull differential base as $null' {
+        $rec = Group-BackupSetRow -Row @(New-BackupRowLike -SetId 20 -Type 'L')
+        $rec.FirstLsn | Should Be ([decimal]'661000017516200011')
+        $rec.DifferentialBaseLsn | Should Be $null
+    }
+
+    It 'falls back to the start time when finish date is null' {
+        $rec = Group-BackupSetRow -Row @(New-BackupRowLike -SetId 30 -FinishDate ([System.DBNull]::Value))
+        $rec.FinishTime | Should Be ([datetime]'2026-09-07 08:38:48')
+    }
+}
+
+Describe 'Test-LsnChain' {
+    function New-Hist {
+        param($Db, $Type, $Ts, $First, $Last, $Fork = 'F1', [switch]$Damaged, [switch]$Copy, $DiffBase)
+        [pscustomobject]@{
+            Instance            = 'I1'
+            Database            = $Db
+            BackupType          = $Type
+            Timestamp           = [datetime]$Ts
+            FirstLsn            = if ($null -eq $First) { $null } else { [decimal]$First }
+            LastLsn             = if ($null -eq $Last) { $null } else { [decimal]$Last }
+            DifferentialBaseLsn = if ($null -eq $DiffBase) { $null } else { [decimal]$DiffBase }
+            ForkGuid            = $Fork
+            IsDamaged           = [bool]$Damaged
+            IsCopyOnly          = [bool]$Copy
+        }
+    }
+
+    It 'reports a contiguous log chain as valid (time gaps do not matter)' {
+        $h = @(
+            (New-Hist 'DB1' 'LOG' '2026-09-01 09:00' 100 200),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:46' 200 350),   # 6-day time gap, LSN contiguous
+            (New-Hist 'DB1' 'LOG' '2026-09-07 09:00' 350 400)
+        )
+        (Test-LsnChain -History $h).Status | Should Be 'valid'
+    }
+
+    It 'reports a broken log chain as error when first_lsn jumps past the previous last_lsn' {
+        $h = @(
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 100 200),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 09:00' 275 400)    # 200 -> 275 : a log is missing
+        )
+        $r = Test-LsnChain -History $h
+        $r.Status | Should Be 'error'
+        (@($r.Findings | Where-Object { $_.Finding -like 'LSN log chain is broken*' }).Count) | Should Be 1
+    }
+
+    It 'flags a recovery fork change mid-chain' {
+        $h = @(
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 100 200 'FORK-A'),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 09:00' 200 300 'FORK-B')
+        )
+        (Test-LsnChain -History $h).Status | Should Be 'error'
+    }
+
+    It 'flags a damaged backup' {
+        $h = @(
+            (New-Hist 'DB1' 'FULL' '2026-09-07 06:00' 10 20 'F1' -Damaged),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 100 200),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 09:00' 200 300)
+        )
+        (Test-LsnChain -History $h).Status | Should Be 'error'
+    }
+
+    It 'ignores copy-only log backups in the chain sequence' {
+        $h = @(
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 100 200),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:30' 100 999 'F1' -Copy),  # copy-only, off to the side
+            (New-Hist 'DB1' 'LOG' '2026-09-07 09:00' 200 300)
+        )
+        (Test-LsnChain -History $h).Status | Should Be 'valid'
+    }
+
+    It 'returns n/a when there is nothing to check' {
+        (Test-LsnChain -History @()).Status | Should Be 'n/a'
+        (Test-LsnChain -History @((New-Hist 'DB1' 'LOG' '2026-09-07 09:00' 100 200))).Status | Should Be 'n/a'
+    }
+
+    It 'warns (not errors) when a DIFF base full is missing from the window' {
+        $h = @(
+            (New-Hist 'DB1' 'FULL' '2026-09-07 06:00' 500 510),
+            (New-Hist 'DB1' 'DIFF' '2026-09-07 07:00' 520 525 'F1' -DiffBase 999)
+        )
+        $r = Test-LsnChain -History $h
+        $r.Status | Should Be 'valid'
+        (@($r.Findings | Where-Object { $_.Severity -eq 'Warning' }).Count) | Should Be 1
+    }
+}
+
+Describe 'Get-BackupPrediction' {
+    function New-ModelSlot {
+        param($Cleanup, $Interval, $Files = 1, $Mode = 'AFTER_BACKUP')
+        [ordered]@{
+            CleanupHours = $Cleanup; IntervalHours = $Interval
+            NumberOfFiles = $Files; CleanupMode = $Mode; Source = @()
+        }
+    }
+    function New-Lb {
+        param($Db, $Type, $Ts, $FileCount = 1)
+        [pscustomobject]@{
+            Instance = 'I1'; Database = $Db; BackupType = $Type
+            Timestamp = [datetime]$Ts; FileCount = $FileCount; IsCopyOnly = $false
+        }
+    }
+
+    $now = [datetime]'2026-09-07 09:00:00'
+    $model = @{
+        'DB1' = @{
+            FULL = (New-ModelSlot 48 24)
+            DIFF = (New-ModelSlot $null $null)
+            LOG  = (New-ModelSlot 6 1 2)
+        }
+    }
+    $logical = @(
+        (New-Lb 'DB1' 'LOG' '2026-09-07 09:00:00' 2),
+        (New-Lb 'DB1' 'LOG' '2026-09-07 08:00:00' 2),
+        (New-Lb 'DB1' 'LOG' '2026-09-07 06:00:00' 1),   # present but only 1 of 2 stripes
+        (New-Lb 'DB1' 'FULL' '2026-09-06 09:00:00' 1)
+    )
+    $pred = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -Now $now)
+    $log = $pred | Where-Object { $_.BackupType -eq 'LOG' }
+    $full = $pred | Where-Object { $_.BackupType -eq 'FULL' }
+    $diff = $pred | Where-Object { $_.BackupType -eq 'DIFF' }
+
+    It 'projects one slot per interval across the retention window' {
+        # cleanup 6h + interval 1h = 7h horizon => slots at 09:00 .. 02:00
+        $log.ExpectedCount | Should Be 8
+    }
+    It 'counts slots that have a matching file' {
+        $log.PresentCount | Should Be 2
+    }
+    It 'flags a slot whose file is missing stripe members as partial' {
+        $log.PartialCount | Should Be 1
+    }
+    It 'lists the missing slot timestamps newest first' {
+        $log.MissingCount | Should Be 5
+        $log.MissingSlots[0] | Should Be ([datetime]'2026-09-07 07:00:00')
+    }
+    It 'uses the newest backup as the schedule phase for FULL' {
+        $full.PresentCount | Should Be 1
+        $full.MissingCount | Should Be 3
+    }
+    It 'marks a type with unknown retention as not predictable' {
+        $diff.Predictable | Should Be $false
+        $diff.ExpectedCount | Should Be $null
     }
 }
 

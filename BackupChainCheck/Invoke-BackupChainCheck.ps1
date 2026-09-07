@@ -31,6 +31,11 @@
         <BackupPath>\<SERVER$INSTANCE>\<Database>\<FULL|DIFF|LOG>\<file>
     Files that do not sit in that structure are parsed from the file name instead.
 
+.PARAMETER Database
+    One or more database-name wildcard patterns to limit the analysis (and the
+    findings) to. Default '*' - every database. Matching is -like, e.g.
+    -Database StackOverflow2010  or  -Database 'JDE_*','ODS'.
+
 .PARAMETER SqlInstance
     Optional. SQL Server instance to read DatabaseBackup job configuration and
     database metadata from (msdb + master, read-only). Windows auth unless
@@ -85,6 +90,15 @@
 .PARAMETER FailOnGap
     Set the exit code: 1 if any Error finding, 2 if only Warnings, 0 otherwise.
 
+.PARAMETER Predict
+    Instead of returning findings, project the set of backups that SHOULD be on
+    disk right now for every in-scope (database, backup type) - one slot every
+    IntervalHours, back to age CleanupHours + IntervalHours - and match each slot
+    to an actual file. Prints a present/expected matrix plus the list of missing
+    slots, and emits one BackupChainCheck.Prediction object per (database, type)
+    on the pipeline (each with a .Slots breakdown). The findings table still
+    prints to the host; -FailOnGap still uses the findings.
+
 .PARAMETER Quiet
     Suppress the console table (the pipeline objects are still returned).
 
@@ -97,6 +111,12 @@
 .EXAMPLE
     .\Invoke-BackupChainCheck.ps1 -BackupPath D:\Backup -FullCleanupTimeHours 48 -FullIntervalHours 24 -FailOnGap
 
+.EXAMPLE
+    .\Invoke-BackupChainCheck.ps1 -SqlInstance WIN10 -BackupPath E:\backups\WIN10 -Database StackOverflow2010
+
+.EXAMPLE
+    .\Invoke-BackupChainCheck.ps1 -SqlInstance WIN10 -BackupPath E:\backups\WIN10 -Database StackOverflow2010 -Predict
+
 .NOTES
     Windows PowerShell 5.1. No external modules required.
 #>
@@ -104,6 +124,8 @@
 param(
     [Parameter(Mandatory)]
     [string[]]$BackupPath,
+
+    [string[]]$Database = '*',
 
     [string]$SqlInstance,
 
@@ -131,6 +153,8 @@ param(
 
     [switch]$FailOnGap,
 
+    [switch]$Predict,
+
     [switch]$Quiet
 )
 
@@ -142,6 +166,17 @@ $ErrorActionPreference = 'Stop'
 
 $script:BackupTypes = @('FULL', 'DIFF', 'LOG')
 $script:Now = Get-Date
+
+# Default table views for the emitted objects (findings, predictions), so a bare
+# run prints a grid rather than a per-object property list. Optional - the script
+# works without it, just less pretty.
+if ($PSScriptRoot) {
+    $script:FormatFile = Join-Path $PSScriptRoot 'BackupChainCheck.Format.ps1xml'
+    if (Test-Path -LiteralPath $script:FormatFile) {
+        try { Update-FormatData -PrependPath $script:FormatFile }
+        catch { Write-Verbose "Could not load $script:FormatFile : $($_.Exception.Message)" }
+    }
+}
 
 #region Helpers -----------------------------------------------------------------
 
@@ -159,6 +194,7 @@ function New-Finding {
         [string]$Detail = ''
     )
     [pscustomobject]@{
+        PSTypeName = 'BackupChainCheck.Finding'
         Instance   = $Instance
         Database   = $Database
         BackupType = $BackupType
@@ -167,6 +203,78 @@ function New-Finding {
         Expected   = $Expected
         Found      = $Found
         Detail     = $Detail
+    }
+}
+
+function Test-DatabaseMatch {
+    <#
+        True if $Name matches any of the -like wildcard patterns in $Pattern.
+        '*' (the default -Database value) matches everything.
+    #>
+    param(
+        [string]$Name,
+        [string[]]$Pattern
+    )
+    foreach ($p in $Pattern) {
+        if ($Name -like $p) { return $true }
+    }
+    return $false
+}
+
+function ConvertFrom-AgentTime {
+    <# SQL Agent stores times of day as the integer HHMMSS (e.g. 180000 = 18:00). #>
+    param([int]$Hhmmss)
+    $h = [math]::Floor($Hhmmss / 10000)
+    $m = [math]::Floor(($Hhmmss % 10000) / 100)
+    return ('{0:00}:{1:00}' -f $h, $m)
+}
+
+function ConvertTo-ScheduleInterval {
+    <#
+        Turns the msdb.dbo.sysschedules frequency columns into an approximate
+        interval in hours plus a human-readable text. Returns
+        @{ IntervalHours = <double|$null>; Text = <string> }.
+
+        Sub-day recurrence (freq_subday_type 2/4/8 = every N sec/min/hour) is the
+        effective cadence. Otherwise the run happens once per active period and
+        the wrapper frequency (daily / weekly / monthly) sets the spacing.
+        Weekly/monthly with several occurrences is averaged - flagged as approx.
+    #>
+    param(
+        [int]$FreqType,
+        [int]$FreqInterval,
+        [int]$FreqSubdayType,
+        [int]$FreqSubdayInterval,
+        [int]$FreqRecurrenceFactor = 0,
+        [int]$ActiveStartTime = 0
+    )
+
+    if ($FreqSubdayType -eq 2 -or $FreqSubdayType -eq 4 -or $FreqSubdayType -eq 8) {
+        $n = [math]::Max(1, $FreqSubdayInterval)
+        $unitHours = switch ($FreqSubdayType) { 2 { 1.0 / 3600 } 4 { 1.0 / 60 } 8 { 1.0 } }
+        $unit = switch ($FreqSubdayType) { 2 { 'second' } 4 { 'minute' } 8 { 'hour' } }
+        $plural = if ($n -ne 1) { 's' } else { '' }
+        return @{ IntervalHours = [math]::Round($n * $unitHours, 4); Text = ('every {0} {1}{2}' -f $n, $unit, $plural) }
+    }
+
+    $at = ConvertFrom-AgentTime $ActiveStartTime
+    switch ($FreqType) {
+        1 { return @{ IntervalHours = $null; Text = 'one time only' } }
+        4 {
+            $days = [math]::Max(1, $FreqInterval)
+            $text = if ($days -eq 1) { "daily at $at" } else { "every $days days at $at" }
+            return @{ IntervalHours = 24.0 * $days; Text = $text }
+        }
+        8 {
+            $dayCount = 0
+            foreach ($bit in 1, 2, 4, 8, 16, 32, 64) { if ($FreqInterval -band $bit) { $dayCount++ } }
+            if ($dayCount -lt 1) { $dayCount = 1 }
+            $weeks = [math]::Max(1, $FreqRecurrenceFactor)
+            return @{ IntervalHours = [math]::Round((168.0 * $weeks) / $dayCount, 2); Text = ("weekly x{0}, {1} day(s)/week at {2} (approx)" -f $weeks, $dayCount, $at) }
+        }
+        16 { return @{ IntervalHours = 730.0; Text = "monthly at $at (approx)" } }
+        32 { return @{ IntervalHours = 730.0; Text = "monthly relative at $at (approx)" } }
+        default { return @{ IntervalHours = $null; Text = "freq_type=$FreqType (not interpreted)" } }
     }
 }
 
@@ -186,6 +294,54 @@ function Get-Median {
     $mid = [int][math]::Floor($sorted.Count / 2)
     if ($sorted.Count % 2 -eq 1) { return [double]$sorted[$mid] }
     return ([double]$sorted[$mid - 1] + [double]$sorted[$mid]) / 2
+}
+
+function Get-RunSummary {
+    <#
+        A single one-line header: run time, scope, @CleanupTime per type (a range
+        when it differs across the scoped databases, '?' when unknown), the count
+        of FULL / DIFF / LOG files present, and the finding tally.
+    #>
+    param(
+        [datetime]$Now,
+        [object[]]$Logical = @(),
+        [hashtable]$Model,
+        [object[]]$Finding = @(),
+        [string]$LsnStatus = 'n/a'
+    )
+
+    [string[]]$dbs = @()
+    if ($Model) { [string[]]$dbs = @($Model.Keys) }
+    if ($dbs.Count -gt 1) { [array]::Sort($dbs) }
+
+    $scope = if ($dbs.Count -eq 1) { $dbs[0] } elseif ($dbs.Count -gt 1) { "$($dbs.Count) databases" } else { 'no databases' }
+
+    $fc = @{ FULL = 0; DIFF = 0; LOG = 0 }
+    foreach ($lb in $Logical) { if ($fc.ContainsKey($lb.BackupType)) { $fc[$lb.BackupType]++ } }
+
+    $ret = @()
+    foreach ($t in $script:BackupTypes) {
+        $min = $null
+        $max = $null
+        foreach ($d in $dbs) {
+            $c = $Model[$d][$t].CleanupHours
+            if ($null -eq $c) { continue }
+            $c = [double]$c
+            if ($null -eq $min -or $c -lt $min) { $min = $c }
+            if ($null -eq $max -or $c -gt $max) { $max = $c }
+        }
+        if ($null -eq $min) { $ret += '?' }
+        elseif ($min -eq $max) { $ret += "$min" }
+        else { $ret += "$min-$max" }
+    }
+
+    $e = @($Finding | Where-Object { $_.Severity -eq 'Error' }).Count
+    $w = @($Finding | Where-Object { $_.Severity -eq 'Warning' }).Count
+    $i = @($Finding | Where-Object { $_.Severity -eq 'Info' }).Count
+    $tally = if (($e + $w + $i) -eq 0) { 'clean' } else { '{0}E {1}W {2}I' -f $e, $w, $i }
+
+    return ('LSN {0}  |  BackupChainCheck {1:yyyy-MM-dd HH:mm}  |  {2}  |  @CleanupTime F/D/L {3}/{4}/{5}h  |  files F/D/L {6}/{7}/{8}  |  {9}' -f `
+            $LsnStatus, $Now, $scope, $ret[0], $ret[1], $ret[2], $fc['FULL'], $fc['DIFF'], $fc['LOG'], $tally)
 }
 
 function ConvertFrom-OlaBackupFile {
@@ -395,6 +551,65 @@ WHERE s.command LIKE '%DatabaseBackup%'
     return $configs
 }
 
+function Get-OlaJobSchedule {
+    <#
+        Reads the SQL Agent schedule(s) attached to each DatabaseBackup job and
+        turns them into an intended cadence per (backup type, database scope).
+        This is the schedule the README calls "how often each backup type is
+        scheduled to run" - authoritative for what SHOULD be on disk, more so
+        than inferring cadence from file spacing. Read-only.
+    #>
+    param(
+        [string]$Instance,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+
+    $q = @"
+SELECT j.name AS JobName, j.enabled AS JobEnabled, s.command AS Command,
+       sch.name AS ScheduleName, sch.enabled AS ScheduleEnabled,
+       sch.freq_type, sch.freq_interval, sch.freq_subday_type, sch.freq_subday_interval,
+       sch.freq_recurrence_factor, sch.active_start_time,
+       CASE WHEN js.next_run_date > 0
+            THEN msdb.dbo.agent_datetime(js.next_run_date, js.next_run_time)
+            ELSE NULL END AS NextRun
+FROM msdb.dbo.sysjobsteps    AS s
+JOIN msdb.dbo.sysjobs        AS j   ON j.job_id = s.job_id
+JOIN msdb.dbo.sysjobschedules AS js ON js.job_id = j.job_id
+JOIN msdb.dbo.sysschedules   AS sch ON sch.schedule_id = js.schedule_id
+WHERE s.command LIKE '%DatabaseBackup%'
+"@
+    $rows = Invoke-SqlQuery -Instance $Instance -Database 'msdb' -Query $q -Credential $Credential
+
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $rows.Rows) {
+        $cmd = [string]$row.Command
+        $typeMatch = [regex]::Match($cmd, "@BackupType\s*=\s*N?'(?<v>FULL|DIFF|LOG)'", 'IgnoreCase')
+        $dbMatch = [regex]::Match($cmd, "@Databases\s*=\s*N?'(?<v>[^']+)'", 'IgnoreCase')
+        if (-not $typeMatch.Success) { continue }
+
+        $sched = ConvertTo-ScheduleInterval `
+            -FreqType ([int]$row.freq_type) `
+            -FreqInterval ([int]$row.freq_interval) `
+            -FreqSubdayType ([int]$row.freq_subday_type) `
+            -FreqSubdayInterval ([int]$row.freq_subday_interval) `
+            -FreqRecurrenceFactor ([int]$row.freq_recurrence_factor) `
+            -ActiveStartTime ([int]$row.active_start_time)
+
+        $out.Add([pscustomobject]@{
+                JobName       = [string]$row.JobName
+                JobEnabled    = ([int]$row.JobEnabled -eq 1)
+                ScheduleName  = [string]$row.ScheduleName
+                Enabled       = ([int]$row.ScheduleEnabled -eq 1)
+                BackupType    = $typeMatch.Groups['v'].Value.ToUpperInvariant()
+                Scope         = if ($dbMatch.Success) { $dbMatch.Groups['v'].Value } else { 'UNKNOWN' }
+                IntervalHours = $sched.IntervalHours
+                ScheduleText  = $sched.Text
+                NextRun       = if ($row.NextRun -is [DBNull]) { $null } else { [datetime]$row.NextRun }
+            })
+    }
+    return $out
+}
+
 function Get-OlaCommandLog {
     <#
         Reads recent BACKUP_DATABASE / BACKUP_LOG rows from <SolutionDatabase>.dbo.CommandLog
@@ -446,9 +661,129 @@ END
                 ErrorMessage = if ($row.ErrorMessage -is [DBNull]) { '' } else { [string]$row.ErrorMessage }
             })
     }
-    # -NoEnumerate so an empty result still returns a (0-count) collection, not $null,
-    # keeping it distinct from the "table not present" case above.
-    return Write-Output -NoEnumerate $log
+    # Return an array (comma-wrapped so an empty result survives the pipeline as a
+    # 0-count array rather than $null - that stays distinct from the "table not
+    # present" case above, which returns $null explicitly). A List[object] pushed
+    # through Write-Output -NoEnumerate trips an ETS binder bug ("Argument types
+    # do not match") in the caller's @(...), so hand back a plain array.
+    return , $log.ToArray()
+}
+
+function ConvertTo-LsnDecimal {
+    <#
+        backupset LSN columns are numeric(25,0); ADO.NET hands them back as
+        [decimal], which holds 25 digits without loss. DBNull -> $null.
+        Never cast an LSN to [double] - that rounds away the low-order digits
+        the chain check compares.
+    #>
+    param($Value)
+    if ($null -eq $Value -or $Value -is [System.DBNull]) { return $null }
+    return [decimal]$Value
+}
+
+function ConvertTo-NullableBool {
+    param($Value)
+    if ($null -eq $Value -or $Value -is [System.DBNull]) { return $false }
+    return [bool]$Value
+}
+
+function Group-BackupSetRow {
+    <#
+        Collapses the (backupset x backupmediafamily) rows returned by
+        Get-BackupSetHistory into one record per logical backup (one
+        backup_set_id), gathering its stripe device paths. Rows whose type is
+        not D / I / L are skipped.
+
+        Takes plain objects (not typed [System.Data.DataRow]) so the tests can
+        pass lightweight stand-ins; only the msdb column names are read.
+    #>
+    param([object[]]$Row = @())
+
+    $typeMap = @{ 'D' = 'FULL'; 'I' = 'DIFF'; 'L' = 'LOG' }
+    $out = New-Object System.Collections.Generic.List[object]
+
+    foreach ($g in ($Row | Group-Object -Property { [string]$_.backup_set_id })) {
+        $r = $g.Group[0]
+        $t = [string]$r.type
+        if (-not $typeMap.ContainsKey($t)) { continue }
+
+        $paths = @($g.Group |
+            Where-Object { $null -ne $_.physical_device_name -and -not ($_.physical_device_name -is [System.DBNull]) } |
+            ForEach-Object { [string]$_.physical_device_name } |
+            Sort-Object -Unique)
+
+        $start = [datetime]$r.backup_start_date
+        $finish = if ($null -eq $r.backup_finish_date -or $r.backup_finish_date -is [System.DBNull]) {
+            $start
+        }
+        else {
+            [datetime]$r.backup_finish_date
+        }
+
+        $out.Add([pscustomobject]@{
+                Instance            = [string]$r.server_name
+                Database            = [string]$r.database_name
+                BackupType          = $typeMap[$t]
+                Timestamp           = $start
+                FinishTime          = $finish
+                AgeHours            = [math]::Round(($script:Now - $start).TotalHours, 2)
+                FirstLsn            = ConvertTo-LsnDecimal $r.first_lsn
+                LastLsn             = ConvertTo-LsnDecimal $r.last_lsn
+                CheckpointLsn       = ConvertTo-LsnDecimal $r.checkpoint_lsn
+                DatabaseBackupLsn   = ConvertTo-LsnDecimal $r.database_backup_lsn
+                DifferentialBaseLsn = ConvertTo-LsnDecimal $r.differential_base_lsn
+                FirstForkGuid       = if ($null -eq $r.first_recovery_fork_guid -or $r.first_recovery_fork_guid -is [System.DBNull]) { $null } else { [string]$r.first_recovery_fork_guid }
+                ForkGuid            = if ($null -eq $r.last_recovery_fork_guid -or $r.last_recovery_fork_guid -is [System.DBNull]) { $null } else { [string]$r.last_recovery_fork_guid }
+                IsCopyOnly          = ConvertTo-NullableBool $r.is_copy_only
+                IsDamaged           = ConvertTo-NullableBool $r.is_damaged
+                HasChecksums        = ConvertTo-NullableBool $r.has_backup_checksums
+                BeginsLogChain      = ConvertTo-NullableBool $r.begins_log_chain
+                RecoveryModel       = [string]$r.recovery_model
+                BackupSetId         = [int]$r.backup_set_id
+                RunBy               = [string]$r.user_name
+                Software            = if ($null -eq $r.software_name -or $r.software_name -is [System.DBNull]) { '' } else { [string]$r.software_name }
+                DeviceCount         = $paths.Count
+                DevicePaths         = $paths
+            })
+    }
+
+    return ($out | Sort-Object Database, BackupType, Timestamp, BackupSetId)
+}
+
+function Get-BackupSetHistory {
+    <#
+        Reads msdb backup history (backupset + backupmediafamily + backupmediaset)
+        for FULL / DIFF / LOG backups started within the last -SinceHours, and
+        returns one record per logical backup with its LSN chain fields and
+        stripe device paths. Read-only. Non-mirror media families only.
+    #>
+    param(
+        [string]$Instance,
+        [double]$SinceHours,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+
+    $hours = [int][math]::Ceiling($SinceHours)
+    $q = @"
+SELECT bs.backup_set_id, bs.database_name, bs.server_name, bs.type,
+       bs.backup_start_date, bs.backup_finish_date,
+       bs.first_lsn, bs.last_lsn, bs.checkpoint_lsn, bs.database_backup_lsn,
+       bs.differential_base_lsn,
+       bs.first_recovery_fork_guid, bs.last_recovery_fork_guid,
+       bs.is_copy_only, bs.is_damaged, bs.has_backup_checksums, bs.begins_log_chain,
+       bs.recovery_model, bs.user_name,
+       ms.software_name,
+       mf.physical_device_name, mf.family_sequence_number
+FROM msdb.dbo.backupset AS bs
+JOIN msdb.dbo.backupmediaset AS ms ON ms.media_set_id = bs.media_set_id
+JOIN msdb.dbo.backupmediafamily AS mf ON mf.media_set_id = bs.media_set_id
+WHERE bs.type IN ('D', 'I', 'L')
+  AND mf.mirror = 0
+  AND bs.backup_start_date >= DATEADD(HOUR, -$hours, SYSDATETIME())
+ORDER BY bs.database_name, bs.backup_start_date, bs.backup_set_id
+"@
+    $rows = Invoke-SqlQuery -Instance $Instance -Database 'msdb' -Query $q -Credential $Credential
+    return Group-BackupSetRow -Row $rows.Rows
 }
 
 function Get-SqlDatabaseInfo {
@@ -522,13 +857,15 @@ function Expand-DatabaseScope {
 function Get-ExpectationModel {
     <#
         Produces $model[$database][$type] = @{ CleanupHours; IntervalHours;
-        NumberOfFiles; CleanupMode; Source } by layering, lowest precedence first:
-        inferred interval  ->  config defaults  ->  SQL job config  ->
-        config per-db  ->  command-line overrides.
+        NumberOfFiles; CleanupMode; ScheduleText; NextRun; Source } by layering,
+        lowest precedence first: inferred interval (files) -> CommandLog cadence
+        -> SQL Agent schedule -> config defaults -> SQL job config -> config
+        per-db -> command-line overrides.
     #>
     param(
         [object[]]$LogicalBackup = @(),
         [object]$JobConfig,
+        [object]$JobSchedule,
         [hashtable]$DatabaseInfo,
         [object]$CommandLog,
         [pscustomobject]$Config,
@@ -549,6 +886,8 @@ function Get-ExpectationModel {
                 IntervalHours = $null
                 NumberOfFiles = 1
                 CleanupMode   = 'AFTER_BACKUP'
+                ScheduleText  = $null
+                NextRun       = $null
                 Source        = @()
             }
         }
@@ -586,6 +925,22 @@ function Get-ExpectationModel {
             if ($model.ContainsKey($db) -and $null -ne $median -and $median -gt 0) {
                 $model[$db][$type].IntervalHours = [math]::Round($median, 2)
                 $model[$db][$type].Source += 'interval:commandlog'
+            }
+        }
+    }
+
+    # 1c. SQL Agent schedule - the intended cadence. Beats file/CommandLog
+    #     inference; still loses to a config file, job-level or -parameter value.
+    if ($JobSchedule -and $DatabaseInfo) {
+        foreach ($sch in ($JobSchedule | Where-Object { $_.Enabled -and $_.JobEnabled -and $null -ne $_.IntervalHours })) {
+            $targets = Expand-DatabaseScope -Scope $sch.Scope -DatabaseInfo $DatabaseInfo
+            foreach ($db in $targets) {
+                if (-not $model.ContainsKey($db)) { continue }
+                $slot = $model[$db][$sch.BackupType]
+                $slot.IntervalHours = $sch.IntervalHours
+                $slot.ScheduleText = $sch.ScheduleText
+                $slot.NextRun = $sch.NextRun
+                $slot.Source += 'interval:schedule'
             }
         }
     }
@@ -630,7 +985,7 @@ function Get-ExpectationModel {
     if ($Config -and $Config.PSObject.Properties['databases'] -and $Config.databases) {
         foreach ($dbProp in $Config.databases.PSObject.Properties) {
             $db = $dbProp.Name
-            if (-not $model.ContainsKey($db)) { $model[$db] = @{}; foreach ($t in $script:BackupTypes) { $model[$db][$t] = [ordered]@{ CleanupHours = $null; IntervalHours = $null; NumberOfFiles = 1; CleanupMode = 'AFTER_BACKUP'; Source = @() } } }
+            if (-not $model.ContainsKey($db)) { $model[$db] = @{}; foreach ($t in $script:BackupTypes) { $model[$db][$t] = [ordered]@{ CleanupHours = $null; IntervalHours = $null; NumberOfFiles = 1; CleanupMode = 'AFTER_BACKUP'; ScheduleText = $null; NextRun = $null; Source = @() } } }
             foreach ($type in $script:BackupTypes) {
                 $cleanKey = "$($type.Substring(0,1))$($type.Substring(1).ToLower())CleanupTimeHours"
                 $intKey = "$($type.Substring(0,1))$($type.Substring(1).ToLower())IntervalHours"
@@ -753,8 +1108,8 @@ function Test-BackupChain {
                 if ($stale.Count -gt 0) {
                     $findings.Add((New-Finding -Instance $instanceLabel -Database $db -BackupType $type -Severity 'Warning' `
                                 -Finding 'Files far older than CleanupTime still present' `
-                                -Expected "<= $cleanup h old" -Found ("{0} file(s), oldest {1} h" -f $stale.Count, [int]($stale[0].AgeHours)) `
-                                -Detail 'Ola cleanup may be failing (permissions, striped-file mismatch), or these are past failures never rolled off.'))
+                                -Expected "<= $cleanup h old" -Found ("{0} file(s), oldest {1:yyyy-MM-dd HH:mm} ({2} h)" -f $stale.Count, $stale[0].Timestamp, [int]($stale[0].AgeHours)) `
+                                -Detail ("Ola only deletes {0} files older than CleanupTime right after a SUCCESSFUL scheduled DatabaseBackup {0} run (CleanupMode={1}). So: the scheduled job has not run or not succeeded since, the backup was taken outside Ola (no cleanup), it is a COPY_ONLY file (never governed by @CleanupTime), a different @Directory, or cleanup has no delete permission." -f $type, $(if ($slot) { $slot.CleanupMode } else { 'AFTER_BACKUP' }))))
                 }
             }
 
@@ -950,6 +1305,338 @@ function Test-BackupChain {
     return $findings
 }
 
+function Test-LsnChain {
+    <#
+        Validates LSN continuity of the LOG backup chain per database, from msdb
+        history: each non-copy-only LOG backup's first_lsn must equal the previous
+        one's last_lsn, on a single recovery fork. Also flags damaged backups and
+        differentials whose base FULL is not in the history window.
+
+        Time gaps are NOT a chain break - a database can sit idle for days with an
+        intact chain. That is what separates this from the file-spacing check in
+        Test-BackupChain.
+
+        Returns [pscustomobject]@{ Status = 'valid' | 'error' | 'n/a'; Findings }.
+    #>
+    param(
+        [object[]]$History = @(),
+        [hashtable]$DatabaseInfo
+    )
+
+    $findings = New-Object System.Collections.Generic.List[object]
+    $checked = $false
+    $instanceLabel = if ($History.Count -gt 0) { $History[0].Instance } else { '' }
+
+    foreach ($grp in ($History | Group-Object Database)) {
+        $db = $grp.Name
+        $recs = @($grp.Group)
+
+        foreach ($d in ($recs | Where-Object { $_.IsDamaged })) {
+            $checked = $true
+            $findings.Add((New-Finding -Instance $instanceLabel -Database $db -BackupType $d.BackupType -Severity 'Error' `
+                        -Finding 'Backup is marked damaged in msdb (is_damaged = 1)' `
+                        -Found ('{0:yyyy-MM-dd HH:mm}' -f $d.Timestamp) `
+                        -Detail 'RESTORE would fail on this backup - the LSN chain cannot pass through it.'))
+        }
+
+        $logs = @($recs |
+            Where-Object { $_.BackupType -eq 'LOG' -and -not $_.IsCopyOnly -and $null -ne $_.FirstLsn -and $null -ne $_.LastLsn } |
+            Sort-Object FirstLsn)
+        if ($logs.Count -ge 2) {
+            $checked = $true
+            $gapCount = 0
+            $forkCount = 0
+            $firstBreak = $null
+            for ($i = 1; $i -lt $logs.Count; $i++) {
+                $prev = $logs[$i - 1]
+                $cur = $logs[$i]
+                if ($prev.ForkGuid -and $cur.ForkGuid -and $prev.ForkGuid -ne $cur.ForkGuid) {
+                    $forkCount++
+                    if (-not $firstBreak) { $firstBreak = $prev }
+                }
+                elseif ($cur.FirstLsn -gt $prev.LastLsn) {
+                    $gapCount++
+                    if (-not $firstBreak) { $firstBreak = $prev }
+                }
+            }
+            if ($gapCount -gt 0) {
+                $findings.Add((New-Finding -Instance $instanceLabel -Database $db -BackupType 'LOG' -Severity 'Error' `
+                            -Finding ('LSN log chain is broken ({0} gap(s))' -f $gapCount) `
+                            -Expected 'each LOG first_lsn = previous LOG last_lsn' `
+                            -Found ('first break after {0:yyyy-MM-dd HH:mm}' -f $firstBreak.Timestamp) `
+                            -Detail 'A LOG backup between two retained ones is missing from msdb (taken by another job/tool, or the database left and re-entered FULL recovery). Point-in-time recovery cannot cross the break.'))
+            }
+            if ($forkCount -gt 0) {
+                $findings.Add((New-Finding -Instance $instanceLabel -Database $db -BackupType 'LOG' -Severity 'Error' `
+                            -Finding ('LSN recovery fork changed mid-chain ({0}x)' -f $forkCount) `
+                            -Found ('first change after {0:yyyy-MM-dd HH:mm}' -f $firstBreak.Timestamp) `
+                            -Detail 'A RESTORE ... WITH RECOVERY or point-in-time restore happened on this database - backups from before the fork cannot roll forward past it.'))
+            }
+        }
+
+        $fulls = @($recs | Where-Object { $_.BackupType -eq 'FULL' -and -not $_.IsCopyOnly -and $null -ne $_.FirstLsn })
+        if ($fulls.Count -gt 0) {
+            foreach ($diff in ($recs | Where-Object { $_.BackupType -eq 'DIFF' -and -not $_.IsCopyOnly -and $null -ne $_.DifferentialBaseLsn })) {
+                $checked = $true
+                $baseFound = $false
+                foreach ($f in $fulls) { if ($f.FirstLsn -eq $diff.DifferentialBaseLsn) { $baseFound = $true; break } }
+                if (-not $baseFound) {
+                    $findings.Add((New-Finding -Instance $instanceLabel -Database $db -BackupType 'DIFF' -Severity 'Warning' `
+                                -Finding 'DIFF base FULL is not in the history window' `
+                                -Found ('DIFF {0:yyyy-MM-dd HH:mm}' -f $diff.Timestamp) `
+                                -Detail 'The full this differential is based on is older than -HistoryHours or is gone. The DIFF only restores if that base full still exists.'))
+                }
+            }
+        }
+    }
+
+    $status = if (-not $checked) { 'n/a' }
+    elseif (@($findings | Where-Object { $_.Severity -eq 'Error' }).Count -gt 0) { 'error' }
+    else { 'valid' }
+
+    return [pscustomobject]@{ Status = $status; Findings = $findings.ToArray() }
+}
+
+function Get-BackupPrediction {
+    <#
+        For every (database, backup type) in $Model with a known retention and
+        interval, projects the backups that SHOULD be on disk now: one slot every
+        IntervalHours, walking back from the current schedule phase to age
+        CleanupHours + IntervalHours (the same window Test-BackupChain treats as
+        "still retained"). Each slot is matched to an actual backup within half an
+        interval. Emits one BackupChainCheck.Prediction record per (database,
+        type), carrying a .Slots array. Pure projection - reads nothing.
+    #>
+    param(
+        [object[]]$LogicalBackup = @(),
+        [hashtable]$Model,
+        [double]$ToleranceFactor = 1.5,
+        [datetime]$Now = $script:Now
+    )
+
+    $out = New-Object System.Collections.Generic.List[object]
+    if (-not $Model) { return $out }
+
+    $byKey = @{}
+    foreach ($lb in ($LogicalBackup | Where-Object { -not $_.IsCopyOnly })) {
+        $k = '{0}|{1}' -f $lb.Database, $lb.BackupType
+        if (-not $byKey.ContainsKey($k)) { $byKey[$k] = New-Object System.Collections.Generic.List[object] }
+        $byKey[$k].Add($lb)
+    }
+
+    foreach ($db in ($Model.Keys | Sort-Object)) {
+        foreach ($type in $script:BackupTypes) {
+            $slot = $Model[$db][$type]
+
+            $actuals = @()
+            if ($byKey.ContainsKey("$db|$type")) { $actuals = @($byKey["$db|$type"] | Sort-Object Timestamp) }
+            $instance = if ($actuals.Count -gt 0) { $actuals[0].Instance } else { '' }
+
+            $cleanup = $slot.CleanupHours
+            $interval = $slot.IntervalHours
+            $stripes = if ($slot.NumberOfFiles -and $slot.NumberOfFiles -gt 1) { [int]$slot.NumberOfFiles } else { 1 }
+
+            $intervalSource = ''
+            foreach ($src in @($slot.Source)) { if ($src -like 'interval:*') { $intervalSource = $src.Substring(9) } }
+
+            if ($null -eq $cleanup -or $null -eq $interval -or $interval -le 0) {
+                $out.Add([pscustomobject]@{
+                        PSTypeName       = 'BackupChainCheck.Prediction'
+                        Instance         = $instance
+                        Database         = $db
+                        BackupType       = $type
+                        Predictable      = $false
+                        IntervalHours    = $interval
+                        IntervalSource   = $intervalSource
+                        CleanupHours     = $cleanup
+                        CleanupMode      = $slot.CleanupMode
+                        Schedule         = $slot.ScheduleText
+                        NextScheduledRun = $slot.NextRun
+                        Stripes          = $stripes
+                        ExpectedCount    = $null
+                        PresentCount     = $actuals.Count
+                        PartialCount     = 0
+                        MissingCount     = $null
+                        OffScheduleCount = 0
+                        NewestExpected   = $null
+                        OldestExpected   = $null
+                        MissingSlots     = @()
+                        OffScheduleTimes = @()
+                        Slots            = @()
+                        Reason           = if ($actuals.Count -eq 0) { 'no retention/interval known and no files present' } else { 'retention or interval unknown - supply -SqlInstance, -ConfigPath or -*IntervalHours' }
+                    })
+                continue
+            }
+
+            $horizon = $cleanup + $interval
+            $tol = $interval / 2.0
+
+            # Schedule phase for the slot grid: prefer the job's next scheduled run
+            # (walk it back to the newest slot at or before now); otherwise fall
+            # back to the newest actual backup, else now.
+            if ($slot.NextRun) {
+                $anchor = $slot.NextRun
+                while ($anchor -gt $Now) { $anchor = $anchor.AddHours(-$interval) }
+            }
+            else {
+                $anchor = if ($actuals.Count -gt 0) { $actuals[$actuals.Count - 1].Timestamp } else { $Now }
+                while ($anchor.AddHours($interval) -le $Now) { $anchor = $anchor.AddHours($interval) }
+            }
+
+            # Match each slot to the closest not-yet-claimed actual within half an
+            # interval, walking newest slot first.
+            $used = New-Object System.Collections.Generic.HashSet[int]
+            $slots = New-Object System.Collections.Generic.List[object]
+            $t = $anchor
+            $idx = 0
+            while ((($Now - $t).TotalHours) -le $horizon) {
+                $idx++
+                $bestI = -1
+                $bestDiff = [double]::MaxValue
+                for ($ai = 0; $ai -lt $actuals.Count; $ai++) {
+                    if ($used.Contains($ai)) { continue }
+                    $diff = [math]::Abs((($actuals[$ai].Timestamp) - $t).TotalHours)
+                    if ($diff -le $tol -and $diff -lt $bestDiff) { $bestDiff = $diff; $bestI = $ai }
+                }
+
+                $status = 'missing'
+                $fileCount = 0
+                $actualTime = $null
+                if ($bestI -ge 0) {
+                    [void]$used.Add($bestI)
+                    $m = $actuals[$bestI]
+                    $fileCount = [int]$m.FileCount
+                    $actualTime = $m.Timestamp
+                    $status = if ($fileCount -lt $stripes) { 'partial' } else { 'present' }
+                }
+                $slots.Add([pscustomobject]@{
+                        Index     = $idx
+                        Expected  = $t
+                        AgeHours  = [math]::Round(($Now - $t).TotalHours, 2)
+                        Status    = $status
+                        FileCount = $fileCount
+                        Actual    = $actualTime
+                    })
+                $t = $t.AddHours(-$interval)
+                if ($idx -ge 100000) { break }   # guard against an absurd Cleanup/Interval ratio
+            }
+
+            $slotsArr = @($slots | Sort-Object Expected -Descending)
+
+            $presentCount = 0
+            $partialCount = 0
+            $missingSlots = New-Object System.Collections.Generic.List[datetime]
+            foreach ($s in $slotsArr) {
+                switch ($s.Status) {
+                    'present' { $presentCount++ }
+                    'partial' { $partialCount++ }
+                    'missing' { $missingSlots.Add($s.Expected) }
+                }
+            }
+
+            # Actuals inside the retention window that no slot claimed = off-schedule extras.
+            $offSchedule = New-Object System.Collections.Generic.List[datetime]
+            for ($ai = 0; $ai -lt $actuals.Count; $ai++) {
+                if ($used.Contains($ai)) { continue }
+                if ((($Now - $actuals[$ai].Timestamp).TotalHours) -gt $horizon) { continue }
+                $offSchedule.Add($actuals[$ai].Timestamp)
+            }
+
+            $out.Add([pscustomobject]@{
+                    PSTypeName       = 'BackupChainCheck.Prediction'
+                    Instance         = $instance
+                    Database         = $db
+                    BackupType       = $type
+                    Predictable      = $true
+                    IntervalHours    = $interval
+                    IntervalSource   = $intervalSource
+                    CleanupHours     = $cleanup
+                    CleanupMode      = $slot.CleanupMode
+                    Schedule         = $slot.ScheduleText
+                    NextScheduledRun = $slot.NextRun
+                    Stripes          = $stripes
+                    ExpectedCount    = $slotsArr.Count
+                    PresentCount     = $presentCount
+                    PartialCount     = $partialCount
+                    MissingCount     = $missingSlots.Count
+                    OffScheduleCount = $offSchedule.Count
+                    NewestExpected   = if ($slotsArr.Count -gt 0) { $slotsArr[0].Expected } else { $null }
+                    OldestExpected   = if ($slotsArr.Count -gt 0) { $slotsArr[$slotsArr.Count - 1].Expected } else { $null }
+                    MissingSlots     = $missingSlots.ToArray()
+                    OffScheduleTimes = $offSchedule.ToArray()
+                    Slots            = $slotsArr
+                    Reason           = ''
+                })
+        }
+    }
+    return $out
+}
+
+function Write-PredictionMatrix {
+    param([object[]]$Prediction = @())
+
+    if (-not $Prediction -or $Prediction.Count -eq 0) {
+        Write-Host 'No predictions - no database in scope has a known retention and interval.'
+        return
+    }
+
+    $cell = {
+        param($p)
+        if (-not $p) { return '.' }
+        if (-not $p.Predictable) { return '?' }
+        $s = '{0}/{1}' -f $p.PresentCount, $p.ExpectedCount
+        if ($p.PartialCount -gt 0) { $s += ' +{0}p' -f $p.PartialCount }
+        return $s
+    }
+
+    $rows = foreach ($db in ($Prediction | ForEach-Object { $_.Database } | Sort-Object -Unique)) {
+        $f = $Prediction | Where-Object { $_.Database -eq $db -and $_.BackupType -eq 'FULL' } | Select-Object -First 1
+        $d = $Prediction | Where-Object { $_.Database -eq $db -and $_.BackupType -eq 'DIFF' } | Select-Object -First 1
+        $l = $Prediction | Where-Object { $_.Database -eq $db -and $_.BackupType -eq 'LOG' } | Select-Object -First 1
+        [pscustomobject]@{
+            Database = $db
+            FULL     = & $cell $f
+            DIFF     = & $cell $d
+            LOG      = & $cell $l
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'Predicted backups on disk now  -  present / expected   (-Predict)'
+    $rows | Format-Table -AutoSize | Out-Host
+    Write-Host '  expected = floor(Cleanup / Interval) + 1 slots inside the retention window'
+    Write-Host '  present  = projected slot has a matching file      ? = retention or interval unknown'
+    Write-Host '  +Np      = N slots present but missing stripe members       . = backup type not in use'
+    Write-Host ''
+
+    $ordered = $Prediction |
+        Where-Object { $_.Predictable -and ($_.MissingCount -gt 0 -or $_.PartialCount -gt 0 -or $_.OffScheduleCount -gt 0) } |
+        Sort-Object Database, @{ E = { [array]::IndexOf($script:BackupTypes, $_.BackupType) } }
+
+    foreach ($p in $ordered) {
+        $cadence = if ($p.Schedule) { "schedule: $($p.Schedule)" } elseif ($p.IntervalSource) { "source: $($p.IntervalSource)" } else { 'source: inferred' }
+        Write-Host ('{0} / {1}  -  interval {2} ({3}), retention {4} ({5}), {6} file(s)/backup' -f `
+                $p.Database, $p.BackupType, (Get-DurationText $p.IntervalHours), $cadence, (Get-DurationText $p.CleanupHours), $p.CleanupMode, $p.Stripes)
+        Write-Host ('   expected {0}, present {1}, partial {2}, missing {3}, off-schedule {4}' -f `
+                $p.ExpectedCount, $p.PresentCount, $p.PartialCount, $p.MissingCount, $p.OffScheduleCount)
+        if ($p.NextScheduledRun) {
+            Write-Host ('   next scheduled run: {0:yyyy-MM-dd HH:mm}' -f $p.NextScheduledRun)
+        }
+        if ($p.MissingCount -gt 0) {
+            $show = @($p.MissingSlots | Select-Object -First 12 | ForEach-Object { $_.ToString('yyyy-MM-dd HH:mm') })
+            $more = $p.MissingCount - $show.Count
+            $line = '   missing slots: ' + ($show -join ', ')
+            if ($more -gt 0) { $line += " (+$more more)" }
+            Write-Host $line
+        }
+        if ($p.OffScheduleCount -gt 0) {
+            $show = @($p.OffScheduleTimes | Select-Object -First 6 | ForEach-Object { $_.ToString('yyyy-MM-dd HH:mm') })
+            Write-Host ('   off-schedule files: ' + ($show -join ', '))
+        }
+        Write-Host ''
+    }
+}
+
 #endregion
 
 #region HTML report --------------------------------------------------------
@@ -1032,8 +1719,10 @@ $logical = @(Group-LogicalBackup -Record $records)
 Write-Verbose "Grouped into $($logical.Count) logical backup(s)."
 
 $jobConfig = $null
+$jobSchedule = @()
 $dbInfo = $null
 $commandLog = $null
+$backupHistory = @()
 if ($SqlInstance) {
     try {
         $jobConfig = @(Get-OlaJobConfig -Instance $SqlInstance -Credential $SqlCredential)
@@ -1044,18 +1733,46 @@ if ($SqlInstance) {
         Write-Warning "Could not read configuration from $SqlInstance : $($_.Exception.Message)"
     }
     try {
+        $jobSchedule = @(Get-OlaJobSchedule -Instance $SqlInstance -Credential $SqlCredential)
+        Write-Verbose "Read $($jobSchedule.Count) DatabaseBackup job schedule(s) from $SqlInstance."
+    }
+    catch {
+        Write-Warning "Could not read job schedules from $SqlInstance : $($_.Exception.Message)"
+    }
+    try {
         $commandLog = Get-OlaCommandLog -Instance $SqlInstance -Database $SolutionDatabase -SinceHours $HistoryHours -Credential $SqlCredential
         if ($null -eq $commandLog) {
             Write-Warning "dbo.CommandLog not found in [$SolutionDatabase] on $SqlInstance - pass -SolutionDatabase if the Maintenance Solution lives elsewhere."
         }
         else {
-            $commandLog = @($commandLog)
             Write-Verbose "Read $($commandLog.Count) CommandLog backup row(s) from [$SolutionDatabase]."
         }
     }
     catch {
         Write-Warning "Could not read dbo.CommandLog from [$SolutionDatabase] on $SqlInstance : $($_.Exception.Message)"
     }
+    try {
+        $backupHistory = @(Get-BackupSetHistory -Instance $SqlInstance -SinceHours $HistoryHours -Credential $SqlCredential)
+        Write-Verbose "Read $($backupHistory.Count) backup-set history record(s) from msdb on $SqlInstance."
+    }
+    catch {
+        Write-Warning "Could not read backup history from msdb on $SqlInstance : $($_.Exception.Message)"
+    }
+}
+
+# Scope everything downstream to -Database (default '*' = no filtering).
+if ($Database -notcontains '*') {
+    $logical = @($logical | Where-Object { Test-DatabaseMatch -Name $_.Database -Pattern $Database })
+    if ($dbInfo) {
+        $scoped = @{}
+        foreach ($k in $dbInfo.Keys) {
+            if (Test-DatabaseMatch -Name $k -Pattern $Database) { $scoped[$k] = $dbInfo[$k] }
+        }
+        $dbInfo = $scoped
+    }
+    if ($commandLog) { $commandLog = @($commandLog | Where-Object { Test-DatabaseMatch -Name $_.Database -Pattern $Database }) }
+    if ($backupHistory) { $backupHistory = @($backupHistory | Where-Object { Test-DatabaseMatch -Name $_.Database -Pattern $Database }) }
+    Write-Verbose ("Scoped to -Database {0}: {1} logical backup(s), {2} database(s)." -f ($Database -join ','), $logical.Count, $(if ($dbInfo) { $dbInfo.Count } else { 0 }))
 }
 
 $override = @{
@@ -1067,7 +1784,7 @@ $override = @{
     'LOG-Interval'  = if ($PSBoundParameters.ContainsKey('LogIntervalHours')) { $LogIntervalHours } else { $null }
 }
 
-$model = Get-ExpectationModel -LogicalBackup $logical -JobConfig $jobConfig -DatabaseInfo $dbInfo -CommandLog $commandLog -Config $config -Override $override
+$model = Get-ExpectationModel -LogicalBackup $logical -JobConfig $jobConfig -JobSchedule $jobSchedule -DatabaseInfo $dbInfo -CommandLog $commandLog -Config $config -Override $override
 
 # Directory-mismatch note.
 if ($jobConfig) {
@@ -1087,15 +1804,23 @@ if ($logical.Count -eq 0) {
 
 $findings = Test-BackupChain -LogicalBackup $logical -Model $model -DatabaseInfo $dbInfo -CommandLog $commandLog -ToleranceFactor $GapToleranceFactor
 
+$lsn = Test-LsnChain -History $backupHistory -DatabaseInfo $dbInfo
+Write-Verbose "LSN chain status: $($lsn.Status) ($($lsn.Findings.Count) finding(s))."
+if ($lsn.Findings.Count -gt 0) { $findings = @($findings) + @($lsn.Findings) }
+
 $sorted = $findings | Sort-Object @{ E = { @('Error', 'Warning', 'Info').IndexOf($_.Severity) } }, Database, BackupType, Finding
 
+$summaryLine = Get-RunSummary -Now $script:Now -Logical $logical -Model $model -Finding $findings -LsnStatus $lsn.Status
+Write-Verbose $summaryLine
+
 if (-not $Quiet) {
+    Write-Host ''
+    Write-Host $summaryLine
     if ($sorted) {
-        $sorted | Format-Table Severity, Database, BackupType, Finding, Expected, Found -AutoSize | Out-Host
         Write-Host ''
         $sorted | Group-Object Severity | ForEach-Object { Write-Host ("  {0,-8} {1}" -f $_.Name, $_.Count) }
     }
-    else {
+    elseif (-not $Predict) {
         Write-Host 'No findings - retention, cadence and files on disk are consistent.' -ForegroundColor Green
     }
 }
@@ -1105,8 +1830,16 @@ if ($ReportPath) {
     if (-not $Quiet) { Write-Host "HTML report: $ReportPath" }
 }
 
-# Emit objects on the pipeline.
-$sorted
+$prediction = $null
+if ($Predict) {
+    $prediction = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -ToleranceFactor $GapToleranceFactor)
+    if (-not $Quiet) { Write-PredictionMatrix -Prediction $prediction }
+}
+
+# Emit objects on the pipeline: the prediction records under -Predict, otherwise
+# the findings.
+if ($Predict) { $prediction }
+else { $sorted }
 
 if ($FailOnGap) {
     $hasError = @($findings | Where-Object { $_.Severity -eq 'Error' }).Count -gt 0
