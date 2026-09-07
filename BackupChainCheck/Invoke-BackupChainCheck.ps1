@@ -2172,7 +2172,8 @@ if (-not $Quiet) {
     Write-Host ''
     $lsnColor = switch ($lsn.Status) { 'valid' { 'Green' } 'error' { 'Red' } default { 'DarkYellow' } }
     $lsnPrefix = "LSN $($lsn.Status)"
-    Write-Host $lsnPrefix -ForegroundColor $lsnColor -NoNewline
+    Write-Host 'LSN ' -ForegroundColor White -NoNewline
+    Write-Host $lsn.Status -ForegroundColor $lsnColor -NoNewline
     Write-Host $summaryLine.Substring($lsnPrefix.Length)
     if ($sorted) {
         Write-Host ''
