@@ -755,6 +755,16 @@ function Group-BackupSetRow {
             [datetime]$r.backup_finish_date
         }
 
+        # Throughput: backup_size (logical bytes processed) over the wall-clock run
+        # time. $null unless we have a size and at least a 1-second duration.
+        $backupSize = if ($null -eq $r.backup_size -or $r.backup_size -is [System.DBNull]) { $null } else { [decimal]$r.backup_size }
+        $compressedSize = if ($null -eq $r.compressed_backup_size -or $r.compressed_backup_size -is [System.DBNull]) { $null } else { [decimal]$r.compressed_backup_size }
+        $durationSeconds = [math]::Round(($finish - $start).TotalSeconds, 1)
+        $speedMBps = $null
+        if ($null -ne $backupSize -and $durationSeconds -ge 1) {
+            $speedMBps = [math]::Round(([double]$backupSize / 1MB) / $durationSeconds, 1)
+        }
+
         $out.Add([pscustomobject]@{
                 Instance            = [string]$r.server_name
                 Database            = [string]$r.database_name
@@ -762,6 +772,10 @@ function Group-BackupSetRow {
                 Timestamp           = $start
                 FinishTime          = $finish
                 AgeHours            = [math]::Round(($script:Now - $start).TotalHours, 2)
+                DurationSeconds     = $durationSeconds
+                BackupSizeBytes     = $backupSize
+                CompressedSizeBytes = $compressedSize
+                SpeedMBps           = $speedMBps
                 FirstLsn            = ConvertTo-LsnDecimal $r.first_lsn
                 LastLsn             = ConvertTo-LsnDecimal $r.last_lsn
                 CheckpointLsn       = ConvertTo-LsnDecimal $r.checkpoint_lsn
@@ -802,6 +816,7 @@ function Get-BackupSetHistory {
     $q = @"
 SELECT bs.backup_set_id, bs.database_name, bs.server_name, bs.type,
        bs.backup_start_date, bs.backup_finish_date,
+       bs.backup_size, bs.compressed_backup_size,
        bs.first_lsn, bs.last_lsn, bs.checkpoint_lsn, bs.database_backup_lsn,
        bs.differential_base_lsn,
        bs.first_recovery_fork_guid, bs.last_recovery_fork_guid,
@@ -1518,6 +1533,7 @@ function Get-BackupPrediction {
     param(
         [object[]]$LogicalBackup = @(),
         [hashtable]$Model,
+        [object[]]$History = @(),
         [double]$ToleranceFactor = 1.5,
         [datetime]$Now = $script:Now
     )
@@ -1530,6 +1546,15 @@ function Get-BackupPrediction {
         $k = '{0}|{1}' -f $lb.Database, $lb.BackupType
         if (-not $byKey.ContainsKey($k)) { $byKey[$k] = New-Object System.Collections.Generic.List[object] }
         $byKey[$k].Add($lb)
+    }
+
+    # Median write throughput per (database, type) from msdb history - the backups
+    # that recorded a size and a run time long enough to divide by.
+    $speedByKey = @{}
+    foreach ($h in ($History | Where-Object { $_.BackupType -and $null -ne $_.SpeedMBps })) {
+        $k = '{0}|{1}' -f $h.Database, $h.BackupType
+        if (-not $speedByKey.ContainsKey($k)) { $speedByKey[$k] = New-Object System.Collections.Generic.List[double] }
+        $speedByKey[$k].Add([double]$h.SpeedMBps)
     }
 
     foreach ($db in ($Model.Keys | Sort-Object)) {
@@ -1547,6 +1572,12 @@ function Get-BackupPrediction {
             $intervalSource = ''
             foreach ($src in @($slot.Source)) { if ($src -like 'interval:*') { $intervalSource = $src.Substring(9) } }
 
+            $speedMBps = $null
+            if ($speedByKey.ContainsKey("$db|$type")) {
+                $speedMBps = Get-Median -Value ([double[]]$speedByKey["$db|$type"])
+                if ($null -ne $speedMBps) { $speedMBps = [math]::Round($speedMBps, 1) }
+            }
+
             if ($null -eq $cleanup -or $null -eq $interval -or $interval -le 0) {
                 $out.Add([pscustomobject]@{
                         PSTypeName       = 'BackupChainCheck.Prediction'
@@ -1560,6 +1591,7 @@ function Get-BackupPrediction {
                         CleanupMode      = $slot.CleanupMode
                         Schedule         = $slot.ScheduleText
                         NextScheduledRun = $slot.NextRun
+                        SpeedMBps        = $speedMBps
                         Stripes          = $stripes
                         ExpectedCount    = $null
                         PresentCount     = $actuals.Count
@@ -1662,6 +1694,7 @@ function Get-BackupPrediction {
                     CleanupMode      = $slot.CleanupMode
                     Schedule         = $slot.ScheduleText
                     NextScheduledRun = $slot.NextRun
+                    SpeedMBps        = $speedMBps
                     Stripes          = $stripes
                     ExpectedCount    = $slotsArr.Count
                     PresentCount     = $presentCount
@@ -1681,7 +1714,10 @@ function Get-BackupPrediction {
 }
 
 function Write-PredictionMatrix {
-    param([object[]]$Prediction = @())
+    param(
+        [object[]]$Prediction = @(),
+        [object[]]$LogicalBackup = @()
+    )
 
     if (-not $Prediction -or $Prediction.Count -eq 0) {
         Write-Host 'No predictions - no database in scope has a known retention and interval.'
@@ -1697,12 +1733,21 @@ function Write-PredictionMatrix {
         return $s
     }
 
+    # Total size on disk of every (non-copy-only) backup file the scan saw, per
+    # database - FULL + DIFF + LOG together.
+    $sizeByDb = @{}
+    foreach ($lb in ($LogicalBackup | Where-Object { -not $_.IsCopyOnly })) {
+        if (-not $sizeByDb.ContainsKey($lb.Database)) { $sizeByDb[$lb.Database] = 0.0 }
+        $sizeByDb[$lb.Database] += [double]$lb.SizeBytes
+    }
+
     $rows = foreach ($db in ($Prediction | ForEach-Object { $_.Database } | Sort-Object -Unique)) {
         $f = $Prediction | Where-Object { $_.Database -eq $db -and $_.BackupType -eq 'FULL' } | Select-Object -First 1
         $d = $Prediction | Where-Object { $_.Database -eq $db -and $_.BackupType -eq 'DIFF' } | Select-Object -First 1
         $l = $Prediction | Where-Object { $_.Database -eq $db -and $_.BackupType -eq 'LOG' } | Select-Object -First 1
         [pscustomobject]@{
             Database = $db
+            Size     = if ($sizeByDb.ContainsKey($db)) { Get-DataSizeText $sizeByDb[$db] } else { '-' }
             FULL     = & $cell $f
             DIFF     = & $cell $d
             LOG      = & $cell $l
@@ -1712,6 +1757,7 @@ function Write-PredictionMatrix {
     Write-Host ''
     Write-Host 'Predicted backups on disk now  -  present / expected   (-Predict)'
     $rows | Format-Table -AutoSize | Out-Host
+    Write-Host '  Size     = total on disk of all FULL + DIFF + LOG files for the database'
     Write-Host '  expected = floor(Cleanup / Interval) + 1 slots inside the retention window'
     Write-Host '  present  = projected slot has a matching file      ? = retention or interval unknown'
     Write-Host '  +Np      = N slots present but missing stripe members       . = backup type not in use'
@@ -1723,8 +1769,9 @@ function Write-PredictionMatrix {
 
     foreach ($p in $ordered) {
         $cadence = if ($p.Schedule) { "schedule: $($p.Schedule)" } elseif ($p.IntervalSource) { "source: $($p.IntervalSource)" } else { 'source: inferred' }
-        Write-Host ('{0} / {1}  -  interval {2} ({3}), retention {4} ({5}), {6} file(s)/backup' -f `
-                $p.Database, $p.BackupType, (Get-DurationText $p.IntervalHours), $cadence, (Get-DurationText $p.CleanupHours), $p.CleanupMode, $p.Stripes)
+        $speedText = if ($null -ne $p.SpeedMBps) { ', ~{0:N1} MB/s' -f $p.SpeedMBps } else { '' }
+        Write-Host ('{0} / {1}  -  interval {2} ({3}), retention {4} ({5}), {6} file(s)/backup{7}' -f `
+                $p.Database, $p.BackupType, (Get-DurationText $p.IntervalHours), $cadence, (Get-DurationText $p.CleanupHours), $p.CleanupMode, $p.Stripes, $speedText)
         Write-Host ('   expected {0}, present {1}, partial {2}, missing {3}, off-schedule {4}' -f `
                 $p.ExpectedCount, $p.PresentCount, $p.PartialCount, $p.MissingCount, $p.OffScheduleCount)
         if ($p.NextScheduledRun) {
@@ -1899,8 +1946,19 @@ function Write-ChainGraph {
             if ($chain.Count -eq 0) { continue }
 
             $interval = $null
-            if ($Model -and $Model.ContainsKey($db)) { $interval = $Model[$db][$type].IntervalHours }
+            $cleanup = $null
+            if ($Model -and $Model.ContainsKey($db)) {
+                $interval = $Model[$db][$type].IntervalHours
+                $cleanup = $Model[$db][$type].CleanupHours
+            }
             $gapH = if ($interval -and $interval -gt 0) { $interval * $ToleranceFactor } elseif ($type -eq 'LOG') { 2.0 } else { 30.0 }
+            # A missing file older than @CleanupTime (plus one interval) has simply
+            # aged out of retention - expected, not a hole. Only flag X inside the
+            # retention window. Unknown retention => flag every gap, as before.
+            $missHorizon = if ($null -ne $cleanup) {
+                [double]$cleanup + $(if ($interval -and $interval -gt 0) { [double]$interval } else { 0 })
+            }
+            else { $null }
 
             $line = New-Object System.Text.StringBuilder
             $notes = New-Object System.Collections.Generic.List[string]
@@ -1908,6 +1966,9 @@ function Write-ChainGraph {
             for ($i = 0; $i -lt $chain.Count; $i++) {
                 $r = $chain[$i]
                 $missing = $usingHistory -and $r.PSObject.Properties['OnDisk'] -and $r.OnDisk -eq $false
+                if ($missing -and $null -ne $missHorizon -and (($Now - $r.Timestamp).TotalHours) -gt $missHorizon) {
+                    $missing = $false
+                }
 
                 if ($i -gt 0) {
                     $prev = $chain[$i - 1]
@@ -1936,7 +1997,9 @@ function Write-ChainGraph {
 
                 if ($missing) {
                     [void]$line.Append('X')
-                    $notes.Add(('    {0:yyyy-MM-dd HH:mm}  file missing on disk (recorded in msdb) - restore stops here' -f $r.Timestamp))
+                    $gone = @(@($r.DevicePaths) | Where-Object { $_ } | ForEach-Object { Split-Path -Path ([string]$_) -Leaf })
+                    $goneText = if ($gone.Count -gt 0) { '[{0}] ' -f ($gone -join ', ') } else { '' }
+                    $notes.Add(('    {0:yyyy-MM-dd HH:mm}  file {1}missing (from msdb) - restore stops here' -f $r.Timestamp, $goneText))
                 }
                 else {
                     [void]$line.Append('|')
@@ -2191,8 +2254,8 @@ if ($ReportPath) {
 
 $prediction = $null
 if ($Predict) {
-    $prediction = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -ToleranceFactor $GapToleranceFactor)
-    if (-not $Quiet) { Write-PredictionMatrix -Prediction $prediction }
+    $prediction = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -History $backupHistory -ToleranceFactor $GapToleranceFactor)
+    if (-not $Quiet) { Write-PredictionMatrix -Prediction $prediction -LogicalBackup $logical }
 }
 
 if ($Graph -and -not $Quiet) {

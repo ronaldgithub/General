@@ -93,7 +93,9 @@ Internal structure of the script, in order:
   `backupmediafamily` + `backupmediaset` for D/I/L backups, one record per
   logical backup with its LSN chain fields (`FirstLsn` … `DifferentialBaseLsn`,
   kept as `[decimal]` — never `[double]`), recovery-fork guids, damage/verify
-  flags and stripe device paths. `Group-BackupSetRow` is the pure shaper the
+  flags, stripe device paths, and size/throughput (`BackupSizeBytes`,
+  `CompressedSizeBytes`, `DurationSeconds`, `SpeedMBps` = `backup_size / run
+  time`, `$null` under a second). `Group-BackupSetRow` is the pure shaper the
   tests drive with stand-in rows. LSN/bool marshalling helpers:
   `ConvertTo-LsnDecimal`, `ConvertTo-NullableBool`.
 - `Get-SqlDatabaseInfo` — `sys.databases` recovery model / state / last backup.
@@ -122,12 +124,17 @@ Internal structure of the script, in order:
 - `Write-ChainGraph` — the `-Graph` mode: an ASCII timeline per (database, type)
   from the annotated history (or files), `|` per backup, `X` for a missing file,
   `~~[dur]~~` / `//gap//` / `//fork//` between. LSN-break markers are LOG-only.
+  `X` (and its "file [name] missing" note) is only drawn inside the retention
+  window — age `<= CleanupHours + IntervalHours`; older missing records aged out
+  and render as `|`. Unknown retention flags every gap.
 - `Get-BackupPrediction` / `Write-PredictionMatrix` — the `-Predict` mode.
   `Get-BackupPrediction` projects, per (database, type) with a known retention +
   interval, the backup slots that should be on disk now (one every interval, back
   to age `Cleanup + Interval`), greedily matches each to the closest unclaimed
   actual within half an interval, and emits a `BackupChainCheck.Prediction`
-  record with a `.Slots` breakdown. Pure; takes `-Now` for testability.
+  record with a `.Slots` breakdown (and `SpeedMBps` — the median
+  `Get-BackupSetHistory` throughput for that database + type; the `MB/s` column
+  in the emitted table). Pure; takes `-History` and `-Now` for testability.
 - `Test-DatabaseMatch` — `-Database` wildcard filter (`-like`, `*` = all).
 - `Write-HtmlReport`.
 

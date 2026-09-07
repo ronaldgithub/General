@@ -42,10 +42,14 @@
       <ViewSelectedBy>
         <TypeName>BackupChainCheck.Prediction</TypeName>
       </ViewSelectedBy>
+      <GroupBy>
+        <PropertyName>Database</PropertyName>
+        <Label>Database</Label>
+      </GroupBy>
       <TableControl>
         <TableHeaders>
-          <TableColumnHeader><Label>Database</Label><Width>24</Width></TableColumnHeader>
           <TableColumnHeader><Label>Type</Label><Width>5</Width></TableColumnHeader>
+          <TableColumnHeader><Label>MB/s</Label><Width>7</Width><Alignment>Right</Alignment></TableColumnHeader>
           <TableColumnHeader><Label>Schedule</Label><Width>16</Width></TableColumnHeader>
           <TableColumnHeader><Label>Interval</Label><Width>9</Width><Alignment>Right</Alignment></TableColumnHeader>
           <TableColumnHeader><Label>Cleanup</Label><Width>8</Width><Alignment>Right</Alignment></TableColumnHeader>
@@ -57,8 +61,8 @@
         <TableRowEntries>
           <TableRowEntry>
             <TableColumnItems>
-              <TableColumnItem><PropertyName>Database</PropertyName></TableColumnItem>
               <TableColumnItem><PropertyName>BackupType</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($null -ne $_.SpeedMBps) { '{0:N1}' -f $_.SpeedMBps } else { '' }</ScriptBlock></TableColumnItem>
               <TableColumnItem><PropertyName>Schedule</PropertyName></TableColumnItem>
               <TableColumnItem><PropertyName>IntervalHours</PropertyName></TableColumnItem>
               <TableColumnItem><PropertyName>CleanupHours</PropertyName></TableColumnItem>

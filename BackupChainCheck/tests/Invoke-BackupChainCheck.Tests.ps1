@@ -258,7 +258,9 @@ Describe 'Group-BackupSetRow' {
             [int]$SetId, [string]$Type = 'D', [string]$Db = 'DB1',
             [string]$Device = 'E:\b\DB1\FULL\DB1_FULL_20260907_083848.bak',
             $DiffBaseLsn = ([System.DBNull]::Value),
-            $FinishDate = ([datetime]'2026-09-07 08:39:00')
+            $FinishDate = ([datetime]'2026-09-07 08:39:00'),
+            $BackupSize = ([decimal]1258291200),           # 1200 MB
+            $CompressedSize = ([decimal]314572800)
         )
         [pscustomobject]@{
             backup_set_id            = $SetId
@@ -267,6 +269,8 @@ Describe 'Group-BackupSetRow' {
             type                     = $Type
             backup_start_date        = [datetime]'2026-09-07 08:38:48'
             backup_finish_date       = $FinishDate
+            backup_size              = $BackupSize
+            compressed_backup_size   = $CompressedSize
             first_lsn                = [decimal]'661000017516200011'
             last_lsn                 = [decimal]'661000017516900001'
             checkpoint_lsn           = [decimal]'661000012988400040'
@@ -315,6 +319,17 @@ Describe 'Group-BackupSetRow' {
     It 'falls back to the start time when finish date is null' {
         $rec = Group-BackupSetRow -Row @(New-BackupRowLike -SetId 30 -FinishDate ([System.DBNull]::Value))
         $rec.FinishTime | Should Be ([datetime]'2026-09-07 08:38:48')
+    }
+
+    It 'computes SpeedMBps from backup_size over the run time' {
+        # 1200 MB over 12 s (08:38:48 -> 08:39:00) = 100 MB/s
+        $rec = Group-BackupSetRow -Row @(New-BackupRowLike -SetId 40 -Type 'D')
+        $rec.SpeedMBps | Should Be 100
+    }
+
+    It 'leaves SpeedMBps null for a sub-second backup' {
+        $rec = Group-BackupSetRow -Row @(New-BackupRowLike -SetId 41 -Type 'L' -FinishDate ([datetime]'2026-09-07 08:38:48'))
+        $rec.SpeedMBps | Should Be $null
     }
 }
 
@@ -490,7 +505,13 @@ Describe 'Get-BackupPrediction' {
         (New-Lb 'DB1' 'LOG' '2026-09-07 06:00:00' 1),   # present but only 1 of 2 stripes
         (New-Lb 'DB1' 'FULL' '2026-09-06 09:00:00' 1)
     )
-    $pred = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -Now $now)
+    $history = @(
+        [pscustomobject]@{ Database = 'DB1'; BackupType = 'FULL'; SpeedMBps = 120.0 },
+        [pscustomobject]@{ Database = 'DB1'; BackupType = 'FULL'; SpeedMBps = 100.0 },
+        [pscustomobject]@{ Database = 'DB1'; BackupType = 'FULL'; SpeedMBps = 140.0 },
+        [pscustomobject]@{ Database = 'DB1'; BackupType = 'LOG';  SpeedMBps = $null }
+    )
+    $pred = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -History $history -Now $now)
     $log = $pred | Where-Object { $_.BackupType -eq 'LOG' }
     $full = $pred | Where-Object { $_.BackupType -eq 'FULL' }
     $diff = $pred | Where-Object { $_.BackupType -eq 'DIFF' }
@@ -516,6 +537,12 @@ Describe 'Get-BackupPrediction' {
     It 'marks a type with unknown retention as not predictable' {
         $diff.Predictable | Should Be $false
         $diff.ExpectedCount | Should Be $null
+    }
+    It 'carries the median msdb throughput as SpeedMBps' {
+        $full.SpeedMBps | Should Be 120
+    }
+    It 'leaves SpeedMBps null when history has no timed backups for the type' {
+        $log.SpeedMBps | Should Be $null
     }
 }
 

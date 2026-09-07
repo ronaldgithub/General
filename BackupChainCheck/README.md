@@ -154,21 +154,29 @@ that should be present right now — one slot every `IntervalHours`, back to age
 ```
 Predicted backups on disk now  -  present / expected   (-Predict)
 
-Database   FULL  DIFF  LOG
---------   ----  ----  ---
-Finance    3/3   4/4   2/49
-Sales      1/3   0/1   47/49
+Database   Size     FULL  DIFF  LOG
+--------   ----     ----  ----  ---
+Finance    182.4 GB 3/3   4/4   2/49
+Sales      41.7 GB  1/3   0/1   47/49
 
 Finance / LOG  -  interval 1h 00m, retention 2d 0h 00m (AFTER_BACKUP), 1 file(s)/backup
    expected 49, present 2, missing 47, off-schedule 1
    missing slots: 2026-09-07 08:00, 2026-09-07 07:00, 2026-09-07 06:00, ... (+44 more)
 ```
 
+The `Size` column is the total on disk of every FULL + DIFF + LOG file the scan
+saw for that database (copy-only excluded).
+
 It emits one `BackupChainCheck.Prediction` object per `(database, type)` on the
 pipeline (each with a `.Slots` array of every projected slot, its age and
-`present` / `partial` / `missing` status, plus `Schedule`, `NextScheduledRun` and
-`IntervalSource`). The findings table still prints to the console, and
-`-FailOnGap` still works off the findings.
+`present` / `partial` / `missing` status, plus `Schedule`, `NextScheduledRun`,
+`IntervalSource` and `SpeedMBps`). The findings table still prints to the
+console, and `-FailOnGap` still works off the findings.
+
+The `MB/s` column in that table (and `SpeedMBps` on the object) is the median
+write throughput for that `(database, type)` from `msdb` history —
+`backup_size / run time` — blank for backups too small or fast to time (most
+LOG backups). Needs `-SqlInstance`.
 
 With `-SqlInstance` the projected slot times come from the **SQL Agent schedule**
 on the DatabaseBackup jobs (`daily at 18:00`, `every 1 hour`, …), so "missing
@@ -209,14 +217,17 @@ Backup chain timeline  (-Graph)
 StackOverflow2010
   FULL | ~~[6d 14h 37m]~~ |-|-|--> now
     2026-08-31 18:01 -> 2026-09-07 08:38  6d 14h 37m, no FULL backups
-  LOG  |-|-|-|-|-|-|-X-|-|-|-|-|-| ~~[11h 00m]~~ | ~~[5d 23h 46m]~~ |-|-|-|--> now
-    2026-08-31 16:00  file missing on disk (recorded in msdb) - restore stops here
-    2026-09-01 09:00 -> 2026-09-07 08:46  5d 23h 46m, no LOG backups
+  LOG  |-|-|-|-|-|-|-|-|-| ~~[11h 00m]~~ |-|-X-|-|-|-|--> now
+    2026-09-07 03:00  file [SQL01_StackOverflow2010_LOG_20260907_030001.trn] missing (from msdb) - restore stops here
 ```
 
 Each `|` is a backup; `X` is one that `msdb` recorded but whose file is gone;
 `~~[…]~~` is an idle stretch; `//gap//` an LSN break; `//fork//` a recovery-fork
 change. Console only — the pipeline is unchanged.
+
+`X` is only drawn for a file young enough to still be inside `@CleanupTime` (plus
+one interval) — a backup older than that has simply aged out of retention, so it
+renders as a plain `|`. With no retention known, every missing file is flagged.
 
 When no retention is supplied (no `-SqlInstance`, no `-ConfigPath`, no
 `-*CleanupTimeHours`), the tool still infers cadence from file spacing and reports
