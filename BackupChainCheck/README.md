@@ -131,9 +131,9 @@ The tool **never writes to SQL Server and never deletes or modifies backup files
     -BackupPath 'D:\Backup','\\nas01\sqlbackup' `
     -ReportPath '.\report.html' -FailOnGap
 
-# One database, predicted-vs-actual matrix + ASCII chain timeline
+# One database: design advice, predicted-vs-actual matrix, ASCII chain timeline
 .\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' -BackupPath 'D:\Backup' `
-    -Database 'Finance' -Predict -Graph
+    -Database 'Finance' -Advice -Predict -Graph
 ```
 
 `-Database` takes one or more `-like` wildcard patterns (default `*` = every
@@ -173,6 +173,30 @@ pipeline (each with a `.Slots` array of every projected slot, its age and
 With `-SqlInstance` the projected slot times come from the **SQL Agent schedule**
 on the DatabaseBackup jobs (`daily at 18:00`, `every 1 hour`, …), so "missing
 slots" line up with the times the backup was actually supposed to run.
+
+### `-Advice` — is the design sane?
+
+`-Advice` prints a short plain-language review of the retention / cadence design
+at the **top** of the output, grouped so an `ALL_DATABASES` job is stated once:
+
+```
+Advice  (-Advice)
+All 16 databases:
+  - DIFF is kept 7d 0h 00m but FULL only 2d 0h 00m. A differential restores only
+    on its base FULL, so DIFFs older than 2d have no base on disk and cannot be
+    restored - and with a daily FULL you barely need DIFFs at all. Set DIFF
+    @CleanupTime to 2d to match FULL.
+  - LOG is kept 1d, shorter than FULL's 2d. Continuous point-in-time restore only
+    reaches back 1d ...
+
+~4.7 GB in 16 backup file(s) on disk is past @CleanupTime or has no restore base
+- mostly cleanup not running or orphaned differentials.
+```
+
+It covers: DIFF retention longer than FULL, LOG retention shorter than FULL,
+`@CleanupTime` below the run cadence, a thin FULL copy count — and an approximate
+figure for backup files on disk that are past `@CleanupTime` or have no restore
+base (summing the file sizes the tool sees). Console only.
 
 ### `-Graph` — the chain, drawn
 
@@ -324,8 +348,8 @@ Working. Implemented and covered by the Pester suite:
   disk (`LSN valid` / `error` headline);
 - `dbo.CommandLog` failure detection; ONLINE-only database scoping; `-Database`
   wildcard filter;
-- `-Predict` (present-vs-expected matrix) and `-Graph` (ASCII chain timeline)
-  console views;
+- `-Advice` (plain-language design review + wasted-space estimate), `-Predict`
+  (present-vs-expected matrix) and `-Graph` (ASCII chain timeline) console views;
 - HTML report and `-FailOnGap` monitoring exit codes.
 
 A future split into a proper module (`src/`, `BackupChainCheck.psd1`) is described

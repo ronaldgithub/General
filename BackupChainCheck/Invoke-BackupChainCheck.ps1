@@ -107,9 +107,16 @@
 
 .PARAMETER Graph
     Draw an ASCII timeline of each database's backup chain - one row per
-    (database, type) with 'o' for a backup present, 'X' for one recorded in msdb
+    (database, type) with '|' for a backup present, 'X' for one recorded in msdb
     whose file is gone, and inline markers where the chain has an idle gap, an
     LSN break or a recovery-fork change. Console only; the pipeline is unchanged.
+
+.PARAMETER Advice
+    Print a short plain-language review of the retention / cadence design at the
+    top of the output - e.g. a DIFF @CleanupTime longer than the FULL one, a LOG
+    retention shorter than FULL, a single-copy FULL - plus an approximate figure
+    for backup files on disk that are past @CleanupTime or have no restore base.
+    Grouped so an ALL_DATABASES job is stated once. Console only.
 
 .PARAMETER Quiet
     Suppress the console table (the pipeline objects are still returned).
@@ -170,6 +177,8 @@ param(
     [switch]$Predict,
 
     [switch]$Graph,
+
+    [switch]$Advice,
 
     [switch]$Quiet
 )
@@ -301,6 +310,15 @@ function Get-DurationText {
         return ('{0}d {1}h {2:00}m' -f [int]$ts.Days, $ts.Hours, $ts.Minutes)
     }
     return ('{0}h {1:00}m' -f [int]$ts.Hours, $ts.Minutes)
+}
+
+function Get-DataSizeText {
+    param([double]$Bytes)
+    if ($Bytes -lt 1KB) { return ('{0} B' -f [int]$Bytes) }
+    if ($Bytes -lt 1MB) { return ('{0:N0} KB' -f ($Bytes / 1KB)) }
+    if ($Bytes -lt 1GB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
+    if ($Bytes -lt 1TB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
+    return ('{0:N2} TB' -f ($Bytes / 1TB))
 }
 
 function Get-Median {
@@ -475,6 +493,7 @@ function Group-LogicalBackup {
                 IsCopyOnly = [bool]($g.Group | Where-Object { $_.IsCopyOnly })
                 IsPartial  = [bool]($g.Group | Where-Object { $_.IsPartial })
                 FileCount  = $g.Count
+                SizeBytes  = [double](($g.Group | Measure-Object -Property LengthBytes -Sum).Sum)
                 Paths      = @($g.Group.Path)
             })
     }
@@ -1726,6 +1745,111 @@ function Write-PredictionMatrix {
     }
 }
 
+function Get-BackupAdvice {
+    <#
+        Plain-language advice about the retention / cadence design, grouped so an
+        ALL_DATABASES job is stated once, plus an approximate figure for backup
+        files on disk that are past @CleanupTime or have no restore base.
+        Returns [string[]] - printed at the top of the output under -Advice.
+    #>
+    param(
+        [hashtable]$Model,
+        [object[]]$LogicalBackup = @(),
+        [hashtable]$DatabaseInfo
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    if (-not $Model -or $Model.Keys.Count -eq 0) { return $lines.ToArray() }
+
+    $sigGroups = @{}
+    foreach ($db in $Model.Keys) {
+        $f = $Model[$db]['FULL']; $d = $Model[$db]['DIFF']; $l = $Model[$db]['LOG']
+        $sig = '{0}|{1}|{2}|{3}|{4}|{5}' -f $f.CleanupHours, $f.IntervalHours, $d.CleanupHours, $d.IntervalHours, $l.CleanupHours, $l.IntervalHours
+        if (-not $sigGroups.ContainsKey($sig)) { $sigGroups[$sig] = New-Object System.Collections.Generic.List[string] }
+        $sigGroups[$sig].Add($db)
+    }
+    $totalDbs = $Model.Keys.Count
+
+    foreach ($sig in $sigGroups.Keys) {
+        $dbs = @($sigGroups[$sig] | Sort-Object)
+        $f = $Model[$dbs[0]]['FULL']; $d = $Model[$dbs[0]]['DIFF']; $l = $Model[$dbs[0]]['LOG']
+        $scope = if ($dbs.Count -eq 1) { $dbs[0] }
+        elseif ($dbs.Count -eq $totalDbs) { "All $($dbs.Count) databases" }
+        else { "$($dbs.Count) databases (e.g. $($dbs[0]))" }
+
+        $fDaily = $f.IntervalHours -and $f.IntervalHours -ge 12 -and $f.IntervalHours -le 30
+        $g = New-Object System.Collections.Generic.List[string]
+
+        if ($null -ne $d.CleanupHours -and $null -ne $f.CleanupHours -and $d.CleanupHours -gt $f.CleanupHours) {
+            $g.Add(("DIFF is kept {0} but FULL only {1}. A differential restores only on its base FULL, so DIFFs older than {1} have no base on disk and cannot be restored{2}. Set DIFF @CleanupTime to {1} to match FULL." -f `
+                    (Get-DurationText $d.CleanupHours), (Get-DurationText $f.CleanupHours), $(if ($fDaily) { ' - and with a daily FULL you barely need DIFFs at all' } else { '' })))
+        }
+
+        if ($null -ne $l.CleanupHours -and $null -ne $f.CleanupHours -and $l.CleanupHours -lt $f.CleanupHours) {
+            $g.Add(("LOG is kept {0}, shorter than FULL's {1}. Continuous point-in-time restore only reaches back {0}; the oldest ~{2} of FULL backups cannot be rolled forward. Match LOG @CleanupTime to {1}." -f `
+                    (Get-DurationText $l.CleanupHours), (Get-DurationText $f.CleanupHours), (Get-DurationText ($f.CleanupHours - $l.CleanupHours))))
+        }
+
+        foreach ($t in $script:BackupTypes) {
+            $s = $Model[$dbs[0]][$t]
+            if ($null -ne $s.CleanupHours -and $s.IntervalHours -and $s.IntervalHours -gt 0 -and $s.CleanupHours -lt $s.IntervalHours) {
+                $g.Add(("{0} @CleanupTime ({1}) is below the {2} run cadence - one failed run can leave zero {0} backups." -f `
+                            $t, (Get-DurationText $s.CleanupHours), (Get-DurationText $s.IntervalHours)))
+            }
+        }
+
+        if ($null -ne $f.CleanupHours -and $f.IntervalHours -and $f.IntervalHours -gt 30) {
+            $kept = [math]::Floor($f.CleanupHours / $f.IntervalHours) + 1
+            if ($kept -le 2) {
+                $g.Add(("FULL runs every {0} and is kept {1} - only ~{2} full copies ever exist. One corrupt full and your fallback is {0} or more of log replay. Raise FULL @CleanupTime (e.g. to {3})." -f `
+                            (Get-DurationText $f.IntervalHours), (Get-DurationText $f.CleanupHours), $kept, (Get-DurationText ($f.IntervalHours * 3))))
+            }
+        }
+
+        if ($g.Count -gt 0) {
+            $lines.Add("${scope}:")
+            foreach ($x in $g) { $lines.Add("  - $x") }
+        }
+    }
+
+    # Approximate wasted / unusable space: files past their retention window, plus
+    # differentials with no base FULL on disk. Each file counted once.
+    $wastedBytes = 0.0
+    $wastedFiles = 0
+    $counted = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($lb in ($LogicalBackup | Where-Object { -not $_.IsCopyOnly })) {
+        $key = if (@($lb.Paths).Count -gt 0) { [string]@($lb.Paths)[0] } else { '{0}|{1}|{2}' -f $lb.Database, $lb.BackupType, $lb.Timestamp }
+        $wasted = $false
+
+        $slot = if ($Model.ContainsKey($lb.Database)) { $Model[$lb.Database][$lb.BackupType] } else { $null }
+        if ($slot -and $null -ne $slot.CleanupHours) {
+            $limit = $slot.CleanupHours + $(if ($slot.IntervalHours) { $slot.IntervalHours } else { 0 })
+            if ($lb.AgeHours -gt $limit) { $wasted = $true }
+        }
+
+        if (-not $wasted -and $lb.BackupType -eq 'DIFF') {
+            $base = @($LogicalBackup | Where-Object {
+                    $_.Database -eq $lb.Database -and $_.BackupType -eq 'FULL' -and -not $_.IsCopyOnly -and $_.Timestamp -le $lb.Timestamp
+                })
+            if ($base.Count -eq 0) { $wasted = $true }
+        }
+
+        if ($wasted -and $counted.Add($key)) {
+            $sz = if ($lb.PSObject.Properties['SizeBytes'] -and $lb.SizeBytes) { [double]$lb.SizeBytes } else { 0 }
+            $wastedBytes += $sz
+            $wastedFiles += $lb.FileCount
+        }
+    }
+
+    if ($wastedFiles -gt 0) {
+        $lines.Add('')
+        $lines.Add(("~{0} in {1} backup file(s) on disk is past @CleanupTime or has no restore base - mostly cleanup not running (failed / stopped jobs) or orphaned differentials. A healthy schedule rolls this off automatically." -f `
+                (Get-DataSizeText $wastedBytes), $wastedFiles))
+    }
+
+    return $lines.ToArray()
+}
+
 function Write-ChainGraph {
     <#
         ASCII timeline of each database's backup chain, one row per (database,
@@ -2034,6 +2158,15 @@ $sorted = $findings | Sort-Object @{ E = { @('Error', 'Warning', 'Info').IndexOf
 
 $summaryLine = Get-RunSummary -Now $script:Now -Logical $logical -Model $model -Finding $findings -LsnStatus $lsn.Status
 Write-Verbose $summaryLine
+
+if ($Advice -and -not $Quiet) {
+    $adviceLines = @(Get-BackupAdvice -Model $model -LogicalBackup $logical -DatabaseInfo $dbInfo)
+    if ($adviceLines.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Advice  (-Advice)' -ForegroundColor Cyan
+        foreach ($a in $adviceLines) { Write-Host $a }
+    }
+}
 
 if (-not $Quiet) {
     Write-Host ''

@@ -1,5 +1,6 @@
 So you're a good DBA (you automated everything), using Ola's maintenance solution ( https://ola.hallengren.com/ )
-and you think you have everying covered, you fill your day looking at Erik Darling's 'Darling Performance Monitoring' service.
+and you think you have everying covered, you fill your day looking at Erik Darling's 
+'Darling Performance Monitoring' service.
 
 Than management asks you do a point in time restore of a database and suddenly 
 the LSN backup chain is invalid. (Somebody made a none copy_only backup and deleted the file, 

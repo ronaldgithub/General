@@ -131,6 +131,60 @@ Describe 'Get-RunSummary' {
     }
 }
 
+Describe 'Get-DataSizeText' {
+    It 'formats bytes / KB / MB / GB' {
+        Get-DataSizeText 512 | Should Be '512 B'
+        Get-DataSizeText 4096 | Should Be '4 KB'
+        Get-DataSizeText (5 * 1MB) | Should Be '5.0 MB'
+        Get-DataSizeText (3 * 1GB) | Should Be '3.0 GB'
+    }
+}
+
+Describe 'Get-BackupAdvice' {
+    function New-Slot { param($C, $I) [ordered]@{ CleanupHours = $C; IntervalHours = $I; NumberOfFiles = 1; CleanupMode = 'AFTER_BACKUP'; Source = @() } }
+    function New-Lb {
+        param($Db, $Type, $AgeHours, $Bytes = 1GB, $Ts = ([datetime]'2026-09-07 06:00'))
+        [pscustomobject]@{ Database = $Db; BackupType = $Type; Timestamp = [datetime]$Ts; AgeHours = $AgeHours
+            IsCopyOnly = $false; FileCount = 1; SizeBytes = [double]$Bytes; Paths = @("x_$Db`_$Type`_$AgeHours.bak") }
+    }
+
+    It 'flags a DIFF kept longer than the FULL retention' {
+        $m = @{ 'DB1' = @{ FULL = (New-Slot 48 24); DIFF = (New-Slot 168 24); LOG = (New-Slot 48 1) } }
+        $a = @(Get-BackupAdvice -Model $m) -join "`n"
+        ($a -like '*DIFF is kept 2d 0h 00m but FULL only 2d 0h 00m*') | Should Be $false   # sanity: not equal
+        ($a -like '*DIFF is kept*7d*FULL only*2d*') | Should Be $true
+        ($a -like '*daily FULL you barely need DIFFs*') | Should Be $true
+    }
+
+    It 'flags a LOG retention shorter than FULL' {
+        $m = @{ 'DB1' = @{ FULL = (New-Slot 168 24); DIFF = (New-Slot 48 24); LOG = (New-Slot 48 1) } }
+        (@(Get-BackupAdvice -Model $m) -join "`n" -like "*LOG is kept*shorter than FULL*") | Should Be $true
+    }
+
+    It 'flags a thin FULL copy count (weekly full, short retention)' {
+        $m = @{ 'DB1' = @{ FULL = (New-Slot 168 168); DIFF = (New-Slot 48 24); LOG = (New-Slot 168 1) } }
+        (@(Get-BackupAdvice -Model $m) -join "`n" -like "*only ~2 full copies ever exist*") | Should Be $true
+    }
+
+    It 'estimates wasted space from files past their retention window' {
+        $m = @{ 'DB1' = @{ FULL = (New-Slot 48 24); DIFF = (New-Slot 48 24); LOG = (New-Slot 48 1) } }
+        $lb = @(
+            (New-Lb 'DB1' 'FULL' 10  (2GB)),   # in window
+            (New-Lb 'DB1' 'FULL' 300 (2GB))    # 300h old, way past 48+24 -> wasted
+        )
+        $a = @(Get-BackupAdvice -Model $m -LogicalBackup $lb) -join "`n"
+        ($a -like '*~2.0 GB in 1 backup file*past @CleanupTime*') | Should Be $true
+    }
+
+    It 'groups identical settings into one block' {
+        $m = @{
+            'A' = @{ FULL = (New-Slot 168 24); DIFF = (New-Slot 48 24); LOG = (New-Slot 48 1) }
+            'B' = @{ FULL = (New-Slot 168 24); DIFF = (New-Slot 48 24); LOG = (New-Slot 48 1) }
+        }
+        (@(Get-BackupAdvice -Model $m) -join "`n" -like "*All 2 databases:*") | Should Be $true
+    }
+}
+
 Describe 'Get-Median' {
     It 'returns the middle value for an odd count' {
         Get-Median -Value @(1, 5, 2) | Should Be 2

@@ -73,7 +73,8 @@ tests/Invoke-BackupChainCheck.Tests.ps1  Pester tests (parsing + math), no SQL.
 Internal structure of the script, in order:
 
 - `New-Finding` (tags output `BackupChainCheck.Finding`) / `Get-DurationText` /
-  `Get-Median` / `Get-RunSummary` (the one-line header) — small helpers.
+  `Get-DataSizeText` / `Get-Median` / `Get-RunSummary` (the one-line header) —
+  small helpers.
 - `ConvertFrom-OlaBackupFile` — one FileInfo (or stand-in) → parsed record.
   Directory structure trusted first, file name is the fallback.
 - `Get-BackupFileInventory` / `Group-LogicalBackup` — scan + collapse striping.
@@ -113,6 +114,11 @@ Internal structure of the script, in order:
   own file is gone). Time gaps are deliberately NOT breaks. Returns
   `@{ Status = 'valid'|'error'|'n/a'; Findings }`; `Status` is the first column
   of the `Get-RunSummary` line (green / red / dark-yellow on the console).
+- `Get-BackupAdvice` — the `-Advice` mode: plain-language notes on the retention
+  / cadence design (DIFF kept longer than FULL, LOG shorter than FULL, cleanup
+  below cadence, thin FULL copy count), grouped by identical settings, plus an
+  approximate wasted-space figure (files past retention + orphaned diffs, summing
+  `SizeBytes` from `Group-LogicalBackup`). Pure; console-only in Main.
 - `Write-ChainGraph` — the `-Graph` mode: an ASCII timeline per (database, type)
   from the annotated history (or files), `|` per backup, `X` for a missing file,
   `~~[dur]~~` / `//gap//` / `//fork//` between. LSN-break markers are LOG-only.
