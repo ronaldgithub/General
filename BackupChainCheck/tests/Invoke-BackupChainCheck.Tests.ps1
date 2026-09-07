@@ -437,6 +437,7 @@ Describe 'Test-LsnChain' {
             (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 200 300 'F1' -Device 'E:\b\DB1\LOG\l2.trn')
         )
         $disk = @(
+            (New-DiskLb 'DB1' 'FULL' '2026-09-07 06:00' 'E:\b\DB1\FULL\f1.bak'),
             (New-DiskLb 'DB1' 'LOG' '2026-09-07 07:00' 'E:\b\DB1\LOG\l1.trn'),
             (New-DiskLb 'DB1' 'LOG' '2026-09-07 08:00' 'E:\b\DB1\LOG\l2.trn')
         )
@@ -450,10 +451,34 @@ Describe 'Test-LsnChain' {
             (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 300 400 'F1' -Device 'E:\b\DB1\LOG\l2.trn')
         )
         $disk = @(
+            (New-DiskLb 'DB1' 'FULL' '2026-09-07 06:00' 'E:\b\DB1\FULL\f1.bak'),
             (New-DiskLb 'DB1' 'LOG' '2026-09-07 07:00' 'E:\b\DB1\LOG\l1.trn'),
             (New-DiskLb 'DB1' 'LOG' '2026-09-07 08:00' 'E:\b\DB1\LOG\l2.trn')
         )
         (Test-LsnChain -History $h -LogicalBackup $disk).Status | Should Be 'valid'
+    }
+
+    It 'errors when the chain has no FULL backup file on disk to restore first' {
+        $h = @(
+            (New-Hist 'DB1' 'FULL' '2026-09-07 06:00' 10 20 'F1' -Device 'E:\b\DB1\FULL\f1.bak'),   # in msdb, file gone
+            (New-Hist 'DB1' 'LOG' '2026-09-07 07:00' 100 200 'F1' -Device 'E:\b\DB1\LOG\l1.trn'),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 200 300 'F1' -Device 'E:\b\DB1\LOG\l2.trn')
+        )
+        $disk = @(
+            (New-DiskLb 'DB1' 'LOG' '2026-09-07 07:00' 'E:\b\DB1\LOG\l1.trn'),
+            (New-DiskLb 'DB1' 'LOG' '2026-09-07 08:00' 'E:\b\DB1\LOG\l2.trn')
+        )
+        $r = Test-LsnChain -History $h -LogicalBackup $disk
+        $r.Status | Should Be 'error'
+        (@($r.Findings | Where-Object { $_.Finding -like 'No FULL backup on disk*' }).Count) | Should Be 1
+    }
+
+    It 'does not raise the no-FULL error without an on-disk view' {
+        $h = @(
+            (New-Hist 'DB1' 'LOG' '2026-09-07 07:00' 100 200),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 200 300)
+        )
+        (Test-LsnChain -History $h).Status | Should Be 'valid'
     }
 }
 

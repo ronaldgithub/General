@@ -67,8 +67,11 @@ databases so you can tell which case it is.
   point-in-time recovery. All gaps for a database roll up into one finding.
 - **LSN chain** (`-SqlInstance`) – from `msdb` history: each LOG's `first_lsn`
   equals the previous `last_lsn` (contiguous, one recovery fork), no `is_damaged`
-  backup, and no LOG recorded in `msdb` inside the on-disk chain window whose file
-  has gone missing. Reported as the `LSN valid` / `error` headline plus findings.
+  backup, no LOG recorded in `msdb` inside the on-disk chain window whose file
+  has gone missing, and – with a backup path to check – **at least one FULL
+  backup file still on disk** for any database that has a LOG/DIFF chain (a
+  chain with no base restores nowhere). Reported as the `LSN valid` / `error`
+  headline plus findings.
 - **DIFF base** (`-SqlInstance`) – each retained differential's
   `differential_base_lsn` matches a FULL that is still in the history window.
 - **Roll-forward coverage** – the oldest retained FULL has a LOG chain starting at
@@ -256,10 +259,13 @@ LSN valid  |  BackupChainCheck 2026-09-07 10:30  |  StackOverflow2010  |  @Clean
 - each LOG backup's `first_lsn` equals the previous one's `last_lsn` — a
   contiguous chain on one recovery fork,
 - no backup is `is_damaged`,
-- and every LOG that `msdb` records **between the oldest and newest LOG that are
+- every LOG that `msdb` records **between the oldest and newest LOG that are
   actually on disk** still has its `.trn` file — so a log deleted (or aged off
   while its neighbours were kept) out of the middle of the retained chain is
-  caught, even though the recorded LSNs still line up.
+  caught, even though the recorded LSNs still line up,
+- and, when a backup path is scanned, **a FULL backup file is still on disk** for
+  any database with a LOG or DIFF chain — an intact chain of logs restores
+  nothing without a base FULL to restore first.
 
 **Time gaps are not a break** — a database can sit idle for days with a perfectly
 intact chain, which is why this can read `valid` even when the file-spacing check

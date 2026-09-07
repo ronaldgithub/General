@@ -113,7 +113,8 @@ Internal structure of the script, in order:
   (each LOG `first_lsn` = previous `last_lsn`, one recovery fork, nothing
   `is_damaged`, DIFF bases present) plus, with `-LogicalBackup`, a hole in the
   on-disk chain (a recorded LOG between the oldest and newest on-disk LOG whose
-  own file is gone). Time gaps are deliberately NOT breaks. Returns
+  own file is gone) and a chain with no FULL backup file left on disk to restore
+  first. Time gaps are deliberately NOT breaks. Returns
   `@{ Status = 'valid'|'error'|'n/a'; Findings }`; `Status` is the first column
   of the `Get-RunSummary` line (green / red / dark-yellow on the console).
 - `Get-BackupAdvice` — the `-Advice` mode: plain-language notes on the retention

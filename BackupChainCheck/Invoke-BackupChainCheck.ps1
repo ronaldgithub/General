@@ -1407,9 +1407,10 @@ function Test-LsnChain {
         history: each non-copy-only LOG backup's first_lsn must equal the previous
         one's last_lsn, on a single recovery fork. Also flags damaged backups,
         differentials whose base FULL is not in the history window, and - when
-        -LogicalBackup is supplied - a hole in the on-disk chain: a LOG that msdb
+        -LogicalBackup is supplied - a hole in the on-disk chain (a LOG that msdb
         records, between the oldest and newest LOG that ARE on disk, whose own
-        .trn file is gone (deleted, or aged off while its neighbours were kept).
+        .trn file is gone) and a chain with no FULL backup file left on disk to
+        restore first.
 
         Time gaps are NOT a chain break - a database can sit idle for days with an
         intact chain. That is what separates this from the file-spacing check in
@@ -1493,6 +1494,25 @@ function Test-LsnChain {
                                 -Expected 'every LOG between the oldest and newest on-disk LOG still on disk' `
                                 -Found ('e.g. {0:yyyy-MM-dd HH:mm} recorded in msdb, file not found' -f $holes[0].Timestamp) `
                                 -Detail 'The LSN chain is intact in msdb but the .trn file is gone (deleted, or aged off while surrounding logs were kept). Point-in-time recovery cannot cross the hole - you can only roll forward to the last LOG whose file exists before it.'))
+                }
+            }
+        }
+
+        # An intact LSN chain is only worth anything if it can be restored, and a
+        # restore starts by restoring a FULL. If this database has a LOG or DIFF
+        # chain in the window but no FULL backup FILE on disk, the chain has no
+        # base - nothing rolls forward - so the verdict is 'error', not 'valid'.
+        if ($checkDisk) {
+            $hasChain = $logs.Count -ge 1 -or @($recs | Where-Object { $_.BackupType -eq 'DIFF' -and -not $_.IsCopyOnly }).Count -gt 0
+            if ($hasChain) {
+                $fullOnDisk = @($LogicalBackup | Where-Object { $_.Database -eq $db -and $_.BackupType -eq 'FULL' -and -not $_.IsCopyOnly })
+                if ($fullOnDisk.Count -eq 0) {
+                    $checked = $true
+                    $findings.Add((New-Finding -Instance $instanceLabel -Database $db -BackupType 'FULL' -Severity 'Error' `
+                                -Finding 'No FULL backup on disk - the log/diff chain has no base to restore' `
+                                -Expected 'at least one FULL backup file on disk' `
+                                -Found '0 FULL file(s)' `
+                                -Detail 'msdb records a continuous LSN chain, but every FULL backup file is gone from the scanned path(s). A point-in-time restore begins by restoring a FULL; without one the DIFF / LOG backups cannot be applied to anything.'))
                 }
             }
         }
