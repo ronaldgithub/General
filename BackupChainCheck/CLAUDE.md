@@ -61,8 +61,9 @@ Invoke-BackupChainCheck.ps1              The whole tool. param() block, helper
                                          (InvocationName -eq '.') so tests can
                                          load the functions without running it.
 BackupChainCheck.Format.ps1xml           Default TableControl views for the emitted
-                                         BackupChainCheck.Finding / .Prediction
-                                         objects. Loaded via Update-FormatData at
+                                         BackupChainCheck.Finding / .Prediction /
+                                         .RestorePlan / .RestoreStep objects.
+                                         Loaded via Update-FormatData at
                                          script start (guarded - the script still
                                          works if it is missing). Optional polish,
                                          not a second code file.
@@ -136,16 +137,30 @@ Internal structure of the script, in order:
   record with a `.Slots` breakdown (and `SpeedMBps` — the median
   `Get-BackupSetHistory` throughput for that database + type; the `MB/s` column
   in the emitted table). Pure; takes `-History` and `-Now` for testability.
+- `Get-RestorePlan` / `Write-RestorePlan` — the `-RestorePlan` mode: per database,
+  the shortest sequence of backup FILES ON DISK that forms a valid LSN chain to
+  the newest recoverable point (newest on-disk FULL → newest on-disk DIFF whose
+  `DifferentialBaseLsn` = that FULL's `FirstLsn` → contiguous on-disk LOGs from
+  the anchor LSN forward). Pure; reads the `Join-BackupSetToFile`-annotated
+  history (LSNs are only in msdb). Emits `BackupChainCheck.RestorePlan` (with a
+  `.Steps` array of `BackupChainCheck.RestoreStep`), `Complete` false + `Reason`
+  when a link's file is gone. Needs `-SqlInstance`.
 - `Test-DatabaseMatch` — `-Database` wildcard filter (`-like`, `*` = all).
 - `Write-HtmlReport`.
+
+**Watch the switch/local-variable name clash:** the `-RestorePlan` switch param
+and any `$restorePlan` local are the same variable (PowerShell is
+case-insensitive) — Main uses `$restorePlans` for the result to avoid clobbering
+the switch. Same trap waits for any future `$predict` / `$graph` / `$advice`.
 
 `#region Main`, in order: load config → scan files → (`-SqlInstance`) read job
 config, schedule, `CommandLog`, backup history → drop non-ONLINE / dropped
 databases unless `-IncludeOfflineDatabases` → apply `-Database` scope →
 `Get-ExpectationModel` → `Test-BackupChain` → `Join-BackupSetToFile` (annotate
 history once) → `Test-LsnChain` → merge findings → `Get-RunSummary` +
-console/`-Predict`/`-Graph` output → HTML report → emit pipeline objects
-(predictions under `-Predict`, else findings) → `-FailOnGap` exit code.
+console/`-Predict`/`-Graph`/`-RestorePlan` output → HTML report → emit pipeline
+objects (predictions under `-Predict`, restore plans under `-RestorePlan`, else
+findings) → `-FailOnGap` exit code.
 
 **A future module split** (`BackupChainCheck.psd1` + `.psm1` + `src/` with one
 public function per file, `docs/ola-conventions.md`) is fine to do later, but keep

@@ -482,6 +482,82 @@ Describe 'Test-LsnChain' {
     }
 }
 
+Describe 'Get-RestorePlan' {
+    function New-PlanRec {
+        param(
+            $Db = 'DB1', $Type, $Ts, $First, $Last, $DiffBase, $Fork = 'F1',
+            [bool]$OnDisk = $true, $Path
+        )
+        $p = if ($null -ne $Path) { $Path } else { "E:\b\DB1\$Type\$Type-$($Ts -replace '[: -]','').bak" }
+        [pscustomobject]@{
+            Instance            = 'I1'; Database = $Db; BackupType = $Type
+            Timestamp           = [datetime]$Ts; FinishTime = [datetime]$Ts
+            FirstLsn            = if ($null -eq $First) { $null } else { [decimal]$First }
+            LastLsn             = if ($null -eq $Last) { $null } else { [decimal]$Last }
+            DifferentialBaseLsn = if ($null -eq $DiffBase) { $null } else { [decimal]$DiffBase }
+            ForkGuid            = $Fork
+            IsCopyOnly          = $false
+            OnDisk              = $OnDisk
+            MatchedPath         = if ($OnDisk) { $p } else { $null }
+            DevicePaths         = @($p)
+        }
+    }
+
+    It 'builds FULL -> newest matching DIFF -> contiguous LOGs to the newest' {
+        $h = @(
+            (New-PlanRec -Type 'FULL' -Ts '2026-09-07 06:00' -First 100 -Last 110),
+            (New-PlanRec -Type 'DIFF' -Ts '2026-09-07 09:00' -First 150 -Last 160 -DiffBase 100),
+            (New-PlanRec -Type 'DIFF' -Ts '2026-09-07 12:00' -First 200 -Last 210 -DiffBase 100),
+            (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 13:00' -First 205 -Last 300),
+            (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 14:00' -First 300 -Last 400)
+        )
+        $plan = @(Get-RestorePlan -History $h)
+        $plan.Count | Should Be 1
+        $plan[0].StepCount | Should Be 4
+        $plan[0].Steps[0].BackupType | Should Be 'FULL'
+        $plan[0].Steps[1].BackupType | Should Be 'DIFF'
+        ('{0:yyyy-MM-dd HH:mm}' -f $plan[0].Steps[1].Timestamp) | Should Be '2026-09-07 12:00'
+        $plan[0].Steps[3].BackupType | Should Be 'LOG'
+        $plan[0].Complete | Should Be $true
+        ('{0:yyyy-MM-dd HH:mm}' -f $plan[0].RecoverableTo) | Should Be '2026-09-07 14:00'
+    }
+
+    It 'reports no plan when no FULL is on disk' {
+        $h = @(
+            (New-PlanRec -Type 'FULL' -Ts '2026-09-07 06:00' -First 100 -Last 110 -OnDisk $false),
+            (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 13:00' -First 105 -Last 300)
+        )
+        $plan = @(Get-RestorePlan -History $h)
+        $plan[0].StepCount | Should Be 0
+        $plan[0].Complete | Should Be $false
+        $plan[0].Reason | Should Match 'No FULL'
+    }
+
+    It 'stops the chain at a missing LOG file and marks the plan partial' {
+        $h = @(
+            (New-PlanRec -Type 'FULL' -Ts '2026-09-07 06:00' -First 100 -Last 110),
+            (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 13:00' -First 105 -Last 300 -Path 'E:\b\DB1\LOG\l1.trn'),
+            (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 14:00' -First 300 -Last 400 -OnDisk $false -Path 'E:\b\DB1\LOG\l2.trn'),
+            (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 15:00' -First 400 -Last 500 -Path 'E:\b\DB1\LOG\l3.trn')
+        )
+        $plan = @(Get-RestorePlan -History $h)
+        $plan[0].StepCount | Should Be 2   # FULL + l1 only
+        $plan[0].Complete | Should Be $false
+        $plan[0].Reason | Should Match 'l2\.trn'
+    }
+
+    It 'ignores a DIFF whose base is not the chosen FULL' {
+        $h = @(
+            (New-PlanRec -Type 'FULL' -Ts '2026-09-07 06:00' -First 500 -Last 510),
+            (New-PlanRec -Type 'DIFF' -Ts '2026-09-07 09:00' -First 300 -Last 320 -DiffBase 100),  # old base
+            (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 13:00' -First 505 -Last 600)
+        )
+        $plan = @(Get-RestorePlan -History $h)
+        @($plan[0].Steps | Where-Object { $_.BackupType -eq 'DIFF' }).Count | Should Be 0
+        $plan[0].StepCount | Should Be 2
+    }
+}
+
 Describe 'Join-BackupSetToFile' {
     It 'matches on device path and flags a missing file' {
         $h = @(

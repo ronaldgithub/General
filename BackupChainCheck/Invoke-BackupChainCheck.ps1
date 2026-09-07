@@ -111,6 +111,13 @@
     whose file is gone, and inline markers where the chain has an idle gap, an
     LSN break or a recovery-fork change. Console only; the pipeline is unchanged.
 
+.PARAMETER RestorePlan
+    Print, per database, the shortest sequence of backup FILES ON DISK that forms
+    a valid LSN chain to the latest recoverable point (newest FULL -> newest
+    matching DIFF -> contiguous LOGs), and emit one BackupChainCheck.RestorePlan
+    object per database (with a .Steps array) on the pipeline instead of the
+    findings. Needs -SqlInstance for the LSNs.
+
 .PARAMETER Advice
     Print a short plain-language review of the retention / cadence design at the
     top of the output - e.g. a DIFF @CleanupTime longer than the FULL one, a LOG
@@ -135,6 +142,9 @@
 
 .EXAMPLE
     .\Invoke-BackupChainCheck.ps1 -SqlInstance WIN10 -BackupPath E:\backups\WIN10 -Database StackOverflow2010 -Predict
+
+.EXAMPLE
+    .\Invoke-BackupChainCheck.ps1 -SqlInstance WIN10 -BackupPath E:\backups\WIN10 -Database StackOverflow2010 -RestorePlan
 
 .NOTES
     Windows PowerShell 5.1. No external modules required.
@@ -177,6 +187,8 @@ param(
     [switch]$Predict,
 
     [switch]$Graph,
+
+    [switch]$RestorePlan,
 
     [switch]$Advice,
 
@@ -1540,6 +1552,183 @@ function Test-LsnChain {
     return [pscustomobject]@{ Status = $status; Findings = $findings.ToArray() }
 }
 
+function Get-RestorePlan {
+    <#
+        Builds, per database, the shortest sequence of backup FILES ON DISK that
+        forms a valid LSN chain to the latest recoverable point: the newest FULL
+        on disk, then the newest DIFF on disk whose differential_base_lsn matches
+        that FULL, then every contiguous LOG on disk from there to the newest.
+
+        Needs msdb history (the LSNs live there, not in the file names) annotated
+        with .OnDisk / .MatchedPath by Join-BackupSetToFile. Pure - reads nothing.
+
+        Emits one BackupChainCheck.RestorePlan per database, each carrying a
+        .Steps array of BackupChainCheck.RestoreStep records (Order, BackupType,
+        Timestamp, Path, FirstLsn, LastLsn). RecoverableTo is the finish time of
+        the last step; Complete is $true when the plan reaches the newest backup
+        on disk.
+    #>
+    param(
+        [object[]]$History = @(),
+        [datetime]$Now = $script:Now
+    )
+
+    $out = New-Object System.Collections.Generic.List[object]
+
+    foreach ($grp in ($History | Group-Object Database)) {
+        $db = $grp.Name
+        $recs = @($grp.Group | Where-Object { -not $_.IsCopyOnly })
+        $instance = if ($recs.Count -gt 0) { $recs[0].Instance } else { '' }
+
+        $pathOf = {
+            param($r)
+            if ($r.PSObject.Properties['MatchedPath'] -and $r.MatchedPath) { return [string]$r.MatchedPath }
+            $dp = @($r.DevicePaths)
+            if ($dp.Count -gt 0) { return [string]$dp[0] }
+            return ''
+        }
+
+        $onDiskAll = @($recs | Where-Object { $_.PSObject.Properties['OnDisk'] -and $_.OnDisk })
+        $newestOnDisk = if ($onDiskAll.Count -gt 0) { @($onDiskAll | Sort-Object Timestamp)[-1] } else { $null }
+
+        $fulls = @($onDiskAll | Where-Object { $_.BackupType -eq 'FULL' -and $null -ne $_.FirstLsn } | Sort-Object Timestamp)
+        if ($fulls.Count -eq 0) {
+            $out.Add([pscustomobject]@{
+                    PSTypeName    = 'BackupChainCheck.RestorePlan'
+                    Instance      = $instance
+                    Database      = $db
+                    Complete      = $false
+                    RecoverableTo = $null
+                    StepCount     = 0
+                    Steps         = @()
+                    Reason        = 'No FULL backup file on disk - nothing to restore from.'
+                })
+            continue
+        }
+
+        $base = $fulls[-1]
+        $steps = New-Object System.Collections.Generic.List[object]
+        $order = 1
+        $steps.Add([pscustomobject]@{
+                PSTypeName = 'BackupChainCheck.RestoreStep'
+                Order      = $order; Database = $db; BackupType = 'FULL'
+                Timestamp  = $base.Timestamp; FinishTime = $base.FinishTime
+                FirstLsn   = $base.FirstLsn; LastLsn = $base.LastLsn
+                Path       = (& $pathOf $base)
+            })
+
+        $anchor = $base.LastLsn
+        $anchorFork = $base.ForkGuid
+
+        $diffs = @($onDiskAll |
+            Where-Object { $_.BackupType -eq 'DIFF' -and $null -ne $_.DifferentialBaseLsn -and $_.DifferentialBaseLsn -eq $base.FirstLsn } |
+            Sort-Object Timestamp)
+        if ($diffs.Count -gt 0) {
+            $diff = $diffs[-1]
+            $order++
+            $steps.Add([pscustomobject]@{
+                    PSTypeName = 'BackupChainCheck.RestoreStep'
+                    Order      = $order; Database = $db; BackupType = 'DIFF'
+                    Timestamp  = $diff.Timestamp; FinishTime = $diff.FinishTime
+                    FirstLsn   = $diff.FirstLsn; LastLsn = $diff.LastLsn
+                    Path       = (& $pathOf $diff)
+                })
+            if ($null -ne $diff.LastLsn) { $anchor = $diff.LastLsn }
+            if ($diff.ForkGuid) { $anchorFork = $diff.ForkGuid }
+        }
+
+        # LOG chain: start at the first on-disk LOG that carries the anchor LSN
+        # forward, then walk contiguous (first_lsn = previous last_lsn, same fork,
+        # file present) to the newest.
+        $logsAll = @($recs | Where-Object { $_.BackupType -eq 'LOG' -and $null -ne $_.FirstLsn -and $null -ne $_.LastLsn } | Sort-Object FirstLsn)
+        $newestLog = if ($logsAll.Count -gt 0) { @($logsAll | Sort-Object Timestamp)[-1] } else { $null }
+
+        $chainBroke = $false
+        $missingNext = $null
+        if ($null -ne $anchor) {
+            $cursor = $anchor
+            $curFork = $anchorFork
+            while ($true) {
+                $next = $null
+                foreach ($l in $logsAll) {
+                    if ($l.FirstLsn -le $cursor -and $l.LastLsn -gt $cursor) { $next = $l; break }
+                }
+                if ($null -eq $next) { break }   # nothing extends the chain - we are current
+                if (-not ($next.PSObject.Properties['OnDisk'] -and $next.OnDisk)) {
+                    $chainBroke = $true
+                    $missingNext = $next
+                    break
+                }
+                if ($curFork -and $next.ForkGuid -and $curFork -ne $next.ForkGuid) { $chainBroke = $true; break }
+                $order++
+                $steps.Add([pscustomobject]@{
+                        PSTypeName = 'BackupChainCheck.RestoreStep'
+                        Order      = $order; Database = $db; BackupType = 'LOG'
+                        Timestamp  = $next.Timestamp; FinishTime = $next.FinishTime
+                        FirstLsn   = $next.FirstLsn; LastLsn = $next.LastLsn
+                        Path       = (& $pathOf $next)
+                    })
+                $cursor = $next.LastLsn
+                if ($next.ForkGuid) { $curFork = $next.ForkGuid }
+            }
+        }
+
+        $last = $steps[$steps.Count - 1]
+        $complete = -not $chainBroke -and (
+            $null -eq $newestOnDisk -or
+            ($last.Timestamp -ge $newestOnDisk.Timestamp) -or
+            ($null -ne $newestLog -and $last.BackupType -eq 'LOG' -and $last.Timestamp -ge $newestLog.Timestamp)
+        )
+
+        $reason = if ($chainBroke -and $missingNext) {
+            'LOG chain stops - next log ({0}) is recorded in msdb but its file is gone.' -f (Split-Path -Path (& $pathOf $missingNext) -Leaf)
+        }
+        elseif ($chainBroke) { 'LOG chain stops - a recovery-fork change or gap on disk.' }
+        elseif (-not $complete) { 'Plan is valid but a newer backup on disk was not reachable from this chain.' }
+        else { '' }
+
+        $out.Add([pscustomobject]@{
+                PSTypeName    = 'BackupChainCheck.RestorePlan'
+                Instance      = $instance
+                Database      = $db
+                Complete      = [bool]$complete
+                RecoverableTo = $last.FinishTime
+                StepCount     = $steps.Count
+                Steps         = $steps.ToArray()
+                Reason        = $reason
+            })
+    }
+
+    return $out
+}
+
+function Write-RestorePlan {
+    param([object[]]$Plan = @())
+
+    Write-Host ''
+    Write-Host 'Restore chain on disk  (-RestorePlan)'
+    if (-not $Plan -or $Plan.Count -eq 0) {
+        Write-Host '  Nothing to plan - no msdb history for the scoped database(s).'
+        return
+    }
+
+    foreach ($p in $Plan) {
+        Write-Host ''
+        Write-Host ("{0}" -f $p.Database) -ForegroundColor Cyan
+        if ($p.StepCount -eq 0) {
+            Write-Host "  $($p.Reason)" -ForegroundColor Red
+            continue
+        }
+        foreach ($s in $p.Steps) {
+            Write-Host ('  {0,2}. {1,-4} {2:yyyy-MM-dd HH:mm:ss}  {3}' -f $s.Order, $s.BackupType, $s.Timestamp, (Split-Path -Path $s.Path -Leaf))
+        }
+        $tag = if ($p.Complete) { 'current' } else { 'PARTIAL' }
+        $color = if ($p.Complete) { 'Green' } else { 'DarkYellow' }
+        Write-Host ('  -> {0} step(s), recoverable to {1:yyyy-MM-dd HH:mm:ss}  [{2}]' -f $p.StepCount, $p.RecoverableTo, $tag) -ForegroundColor $color
+        if ($p.Reason) { Write-Host "     $($p.Reason)" -ForegroundColor DarkYellow }
+    }
+}
+
 function Get-BackupPrediction {
     <#
         For every (database, backup type) in $Model with a known retention and
@@ -2282,9 +2471,22 @@ if ($Graph -and -not $Quiet) {
     Write-ChainGraph -History $backupHistory -LogicalBackup $logical -Model $model -ToleranceFactor $GapToleranceFactor
 }
 
-# Emit objects on the pipeline: the prediction records under -Predict, otherwise
-# the findings.
+$restorePlans = $null
+if ($RestorePlan) {
+    if ($backupHistory.Count -eq 0) {
+        Write-Warning 'RestorePlan needs msdb history - supply -SqlInstance.'
+        $restorePlans = @()
+    }
+    else {
+        $restorePlans = @(Get-RestorePlan -History $backupHistory)
+    }
+    if (-not $Quiet) { Write-RestorePlan -Plan $restorePlans }
+}
+
+# Emit objects on the pipeline: prediction records under -Predict, restore-plan
+# records under -RestorePlan, otherwise the findings.
 if ($Predict) { $prediction }
+elseif ($RestorePlan) { $restorePlans }
 else { $sorted }
 
 if ($FailOnGap) {

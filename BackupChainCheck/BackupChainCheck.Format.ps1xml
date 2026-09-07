@@ -76,5 +76,61 @@
       </TableControl>
     </View>
 
+    <View>
+      <Name>BackupChainCheck.RestorePlan</Name>
+      <ViewSelectedBy>
+        <TypeName>BackupChainCheck.RestorePlan</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Database</Label><Width>24</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Steps</Label><Width>5</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>RecoverableTo</Label><Width>19</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Complete</Label><Width>8</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Reason</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Database</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>StepCount</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($_.RecoverableTo) { '{0:yyyy-MM-dd HH:mm:ss}' -f $_.RecoverableTo } else { '' }</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>Complete</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Reason</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <View>
+      <Name>BackupChainCheck.RestoreStep</Name>
+      <ViewSelectedBy>
+        <TypeName>BackupChainCheck.RestoreStep</TypeName>
+      </ViewSelectedBy>
+      <GroupBy>
+        <PropertyName>Database</PropertyName>
+        <Label>Database</Label>
+      </GroupBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>#</Label><Width>3</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>Type</Label><Width>4</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Timestamp</Label><Width>19</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Path</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Order</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>BackupType</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>'{0:yyyy-MM-dd HH:mm:ss}' -f $_.Timestamp</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>Path</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
   </ViewDefinitions>
 </Configuration>

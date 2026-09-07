@@ -137,6 +137,10 @@ The tool **never writes to SQL Server and never deletes or modifies backup files
 # One database: design advice, predicted-vs-actual matrix, ASCII chain timeline
 .\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' -BackupPath 'D:\Backup' `
     -Database 'Finance' -Advice -Predict -Graph
+
+# The restore chain: the files on disk that form a valid LSN set to "now"
+.\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' -BackupPath 'D:\Backup' `
+    -Database 'Finance' -RestorePlan
 ```
 
 `-Database` takes one or more `-like` wildcard patterns (default `*` = every
@@ -237,6 +241,30 @@ one interval) — a backup older than that has simply aged out of retention, so 
 renders as a plain `|`. With no retention known, every missing file is flagged.
 
 ![-Graph output for StackOverflow2010](pic/03.png)
+
+### `-RestorePlan` — the files that form a valid LSN set
+
+`-RestorePlan` prints, per database, the **shortest sequence of backup files on
+disk** that forms a valid LSN chain to the latest recoverable point: the newest
+FULL on disk, then the newest DIFF on disk whose `differential_base_lsn` matches
+that FULL, then every contiguous LOG on disk from there to the newest.
+
+```
+Restore chain on disk  (-RestorePlan)
+
+StackOverflow2010
+   1. FULL 2026-09-07 18:00:57  WIN10_StackOverflow2010_FULL_20260907_180057.bak
+   2. DIFF 2026-09-07 18:30:04  WIN10_StackOverflow2010_DIFF_20260907_183004.bak
+   3. LOG  2026-09-07 19:00:01  WIN10_StackOverflow2010_LOG_20260907_190001.trn
+  -> 3 step(s), recoverable to 2026-09-07 19:00:01  [current]
+```
+
+If a link's file is gone, the plan stops at the last usable file and is marked
+`[PARTIAL]` with the name of the missing next backup. It emits one
+`BackupChainCheck.RestorePlan` per database on the pipeline (each with a `.Steps`
+array of `Order` / `BackupType` / `Timestamp` / `Path` / `FirstLsn` / `LastLsn`,
+plus `RecoverableTo` and `Complete`) instead of the findings. Needs
+`-SqlInstance` — the LSNs come from `msdb`, not the file names.
 
 When no retention is supplied (no `-SqlInstance`, no `-ConfigPath`, no
 `-*CleanupTimeHours`), the tool still infers cadence from file spacing and reports
@@ -372,7 +400,8 @@ Working. Implemented and covered by the Pester suite:
 - `dbo.CommandLog` failure detection; ONLINE-only database scoping; `-Database`
   wildcard filter;
 - `-Advice` (plain-language design review + wasted-space estimate), `-Predict`
-  (present-vs-expected matrix) and `-Graph` (ASCII chain timeline) console views;
+  (present-vs-expected matrix), `-Graph` (ASCII chain timeline) and
+  `-RestorePlan` (the on-disk files that form a valid LSN set) console views;
 - HTML report and `-FailOnGap` monitoring exit codes.
 
 A future split into a proper module (`src/`, `BackupChainCheck.psd1`) is described
