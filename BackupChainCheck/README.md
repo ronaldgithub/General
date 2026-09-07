@@ -185,6 +185,8 @@ With `-SqlInstance` the projected slot times come from the **SQL Agent schedule*
 on the DatabaseBackup jobs (`daily at 18:00`, `every 1 hour`, …), so "missing
 slots" line up with the times the backup was actually supposed to run.
 
+![-Predict output for StackOverflow2010](pic/04.png)
+
 ### `-Advice` — is the design sane?
 
 `-Advice` prints a short plain-language review of the retention / cadence design
@@ -209,6 +211,8 @@ It covers: DIFF retention longer than FULL, LOG retention shorter than FULL,
 figure for backup files on disk that are past `@CleanupTime` or have no restore
 base (summing the file sizes the tool sees). Console only.
 
+![-Advice output for StackOverflow2010](pic/01.png)
+
 ### `-Graph` — the chain, drawn
 
 `-Graph` prints an ASCII timeline per `(database, type)`:
@@ -231,6 +235,8 @@ change. Console only — the pipeline is unchanged.
 `X` is only drawn for a file young enough to still be inside `@CleanupTime` (plus
 one interval) — a backup older than that has simply aged out of retention, so it
 renders as a plain `|`. With no retention known, every missing file is flagged.
+
+![-Graph output for StackOverflow2010](pic/03.png)
 
 When no retention is supplied (no `-SqlInstance`, no `-ConfigPath`, no
 `-*CleanupTimeHours`), the tool still infers cadence from file spacing and reports
