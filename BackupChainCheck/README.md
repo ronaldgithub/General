@@ -134,6 +134,11 @@ The tool **never writes to SQL Server and never deletes or modifies backup files
 `-Database` takes one or more `-like` wildcard patterns (default `*` = every
 database) and scopes the whole analysis, not just the printed table.
 
+With `-SqlInstance`, the analysis is limited to databases that currently exist
+and are **ONLINE** in `sys.databases` — stale `dbo.CommandLog` rows and orphaned
+files for dropped or renamed databases (a leftover `_ODS`, say) are ignored.
+`-IncludeOfflineDatabases` keeps them.
+
 ### `-Predict` — what *should* be on disk
 
 `-Predict` turns the retention math around: for every in-scope `(database, backup

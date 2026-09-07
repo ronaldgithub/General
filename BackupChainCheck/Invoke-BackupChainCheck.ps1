@@ -84,6 +84,12 @@
     Include *_COPY_ONLY files in the analysis. Off by default (they are not governed
     by @CleanupTime and do not participate in the restore chain).
 
+.PARAMETER IncludeOfflineDatabases
+    With -SqlInstance, the analysis is restricted to databases that currently
+    exist and are ONLINE in sys.databases; backups on disk / in dbo.CommandLog for
+    databases that were dropped or renamed (e.g. a stale '_ODS') are ignored. Set
+    this switch to analyse every database that has backups, online or not.
+
 .PARAMETER ReportPath
     Optional path for a standalone HTML report.
 
@@ -148,6 +154,8 @@ param(
     [double]$GapToleranceFactor = 1.5,
 
     [switch]$IncludeCopyOnly,
+
+    [switch]$IncludeOfflineDatabases,
 
     [string]$ReportPath,
 
@@ -1831,6 +1839,24 @@ if ($SqlInstance) {
     catch {
         Write-Warning "Could not read backup history from msdb on $SqlInstance : $($_.Exception.Message)"
     }
+}
+
+# Drop databases that no longer exist / are not ONLINE in sys.databases - stale
+# dbo.CommandLog rows and orphaned files for dropped or renamed databases.
+if ($dbInfo -and -not $IncludeOfflineDatabases) {
+    $live = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in $dbInfo.Keys) { if ($dbInfo[$k].State -eq 'ONLINE') { [void]$live.Add($k) } }
+
+    $droppedFrom = @($logical | Where-Object { -not $live.Contains($_.Database) } | ForEach-Object { $_.Database } | Sort-Object -Unique)
+    $logical = @($logical | Where-Object { $live.Contains($_.Database) })
+    if ($commandLog) { $commandLog = @($commandLog | Where-Object { $live.Contains($_.Database) }) }
+    if ($backupHistory) { $backupHistory = @($backupHistory | Where-Object { $live.Contains($_.Database) }) }
+    $onlineInfo = @{}
+    foreach ($k in $dbInfo.Keys) { if ($live.Contains($k)) { $onlineInfo[$k] = $dbInfo[$k] } }
+    $dbInfo = $onlineInfo
+
+    Write-Verbose ("Restricted to {0} ONLINE database(s); ignoring backups for: {1} (use -IncludeOfflineDatabases to keep them)." -f `
+            $live.Count, $(if ($droppedFrom.Count -gt 0) { $droppedFrom -join ', ' } else { '(none)' }))
 }
 
 # Scope everything downstream to -Database (default '*' = no filtering).
