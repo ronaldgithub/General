@@ -257,13 +257,24 @@ StackOverflow2010
    2. DIFF 2026-09-07 18:30:04  WIN10_StackOverflow2010_DIFF_20260907_183004.bak
    3. LOG  2026-09-07 19:00:01  WIN10_StackOverflow2010_LOG_20260907_190001.trn
   -> 3 step(s), recoverable to 2026-09-07 19:00:01  [current]
+
+    -- StackOverflow2010  ->  recoverable to 2026-09-07 19:00:01
+    RESTORE DATABASE [StackOverflow2010] FROM DISK = N'...\WIN10_StackOverflow2010_FULL_20260907_180057.bak' WITH NORECOVERY;
+    RESTORE DATABASE [StackOverflow2010] FROM DISK = N'...\WIN10_StackOverflow2010_DIFF_20260907_183004.bak' WITH NORECOVERY;
+    RESTORE LOG      [StackOverflow2010] FROM DISK = N'...\WIN10_StackOverflow2010_LOG_20260907_190001.trn' WITH NORECOVERY;
+    RESTORE DATABASE [StackOverflow2010] WITH RECOVERY;
 ```
 
+Every step is `WITH NORECOVERY`, then a trailing `RESTORE DATABASE … WITH
+RECOVERY;` when the chain is complete; a striped backup lists all its `DISK =`
+members. Restoring on a different server may need `WITH MOVE`.
+
 If a link's file is gone, the plan stops at the last usable file and is marked
-`[PARTIAL]` with the name of the missing next backup. It emits one
-`BackupChainCheck.RestorePlan` per database on the pipeline (each with a `.Steps`
-array of `Order` / `BackupType` / `Timestamp` / `Path` / `FirstLsn` / `LastLsn`,
-plus `RecoverableTo` and `Complete`) instead of the findings. Needs
+`[PARTIAL]` with the name of the missing next backup (and the script stays all
+`NORECOVERY`). It emits one `BackupChainCheck.RestorePlan` per database on the
+pipeline (each with a `.Steps` array of `Order` / `BackupType` / `Timestamp` /
+`Path` / `Paths` / `FirstLsn` / `LastLsn`, plus `RecoverableTo`, `Complete` and
+the ready-to-run `RestoreScript` string) instead of the findings. Needs
 `-SqlInstance` — the LSNs come from `msdb`, not the file names.
 
 When no retention is supplied (no `-SqlInstance`, no `-ConfigPath`, no

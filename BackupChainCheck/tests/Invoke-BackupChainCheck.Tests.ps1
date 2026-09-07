@@ -522,7 +522,18 @@ Describe 'Get-RestorePlan' {
         ('{0:yyyy-MM-dd HH:mm}' -f $plan[0].RecoverableTo) | Should Be '2026-09-07 14:00'
     }
 
-    It 'reports no plan when no FULL is on disk' {
+    It 'emits a T-SQL RESTORE script for a complete plan' {
+        $h = @(
+            (New-PlanRec -Type 'FULL' -Ts '2026-09-07 06:00' -First 100 -Last 110 -Path 'E:\b\DB1\FULL\f.bak'),
+            (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 13:00' -First 105 -Last 300 -Path 'E:\b\DB1\LOG\l1.trn')
+        )
+        $s = (Get-RestorePlan -History $h)[0].RestoreScript
+        $s | Should Match "RESTORE DATABASE \[DB1\] FROM DISK = N'E:\\b\\DB1\\FULL\\f\.bak' WITH NORECOVERY;"
+        $s | Should Match "RESTORE LOG \[DB1\] FROM DISK = N'E:\\b\\DB1\\LOG\\l1\.trn' WITH NORECOVERY;"
+        $s | Should Match 'RESTORE DATABASE \[DB1\] WITH RECOVERY;'
+    }
+
+    It 'reports no plan (and no script) when no FULL is on disk' {
         $h = @(
             (New-PlanRec -Type 'FULL' -Ts '2026-09-07 06:00' -First 100 -Last 110 -OnDisk $false),
             (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 13:00' -First 105 -Last 300)
@@ -531,9 +542,10 @@ Describe 'Get-RestorePlan' {
         $plan[0].StepCount | Should Be 0
         $plan[0].Complete | Should Be $false
         $plan[0].Reason | Should Match 'No FULL'
+        $plan[0].RestoreScript | Should Be ''
     }
 
-    It 'stops the chain at a missing LOG file and marks the plan partial' {
+    It 'stops the chain at a missing LOG file, marks it partial, and leaves the script NORECOVERY' {
         $h = @(
             (New-PlanRec -Type 'FULL' -Ts '2026-09-07 06:00' -First 100 -Last 110),
             (New-PlanRec -Type 'LOG'  -Ts '2026-09-07 13:00' -First 105 -Last 300 -Path 'E:\b\DB1\LOG\l1.trn'),
@@ -544,6 +556,8 @@ Describe 'Get-RestorePlan' {
         $plan[0].StepCount | Should Be 2   # FULL + l1 only
         $plan[0].Complete | Should Be $false
         $plan[0].Reason | Should Match 'l2\.trn'
+        $plan[0].RestoreScript | Should Match 'chain incomplete'
+        $plan[0].RestoreScript | Should Not Match 'RESTORE DATABASE \[DB1\] WITH RECOVERY;'
     }
 
     It 'ignores a DIFF whose base is not the chosen FULL' {

@@ -143,8 +143,10 @@ Internal structure of the script, in order:
   `DifferentialBaseLsn` = that FULL's `FirstLsn` → contiguous on-disk LOGs from
   the anchor LSN forward). Pure; reads the `Join-BackupSetToFile`-annotated
   history (LSNs are only in msdb). Emits `BackupChainCheck.RestorePlan` (with a
-  `.Steps` array of `BackupChainCheck.RestoreStep`), `Complete` false + `Reason`
-  when a link's file is gone. Needs `-SqlInstance`.
+  `.Steps` array of `BackupChainCheck.RestoreStep` and a `.RestoreScript` string
+  of the T-SQL `RESTORE … WITH NORECOVERY` statements + trailing `WITH RECOVERY`
+  when complete; striped backups list every `DISK =` member), `Complete` false +
+  `Reason` when a link's file is gone. Needs `-SqlInstance`.
 - `Test-DatabaseMatch` — `-Database` wildcard filter (`-like`, `*` = all).
 - `Write-HtmlReport`.
 

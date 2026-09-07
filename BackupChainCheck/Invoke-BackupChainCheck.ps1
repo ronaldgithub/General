@@ -114,9 +114,10 @@
 .PARAMETER RestorePlan
     Print, per database, the shortest sequence of backup FILES ON DISK that forms
     a valid LSN chain to the latest recoverable point (newest FULL -> newest
-    matching DIFF -> contiguous LOGs), and emit one BackupChainCheck.RestorePlan
-    object per database (with a .Steps array) on the pipeline instead of the
-    findings. Needs -SqlInstance for the LSNs.
+    matching DIFF -> contiguous LOGs), together with the T-SQL RESTORE script,
+    and emit one BackupChainCheck.RestorePlan object per database (with a .Steps
+    array and a .RestoreScript string) on the pipeline instead of the findings.
+    Needs -SqlInstance for the LSNs.
 
 .PARAMETER Advice
     Print a short plain-language review of the retention / cadence design at the
@@ -1564,9 +1565,10 @@ function Get-RestorePlan {
 
         Emits one BackupChainCheck.RestorePlan per database, each carrying a
         .Steps array of BackupChainCheck.RestoreStep records (Order, BackupType,
-        Timestamp, Path, FirstLsn, LastLsn). RecoverableTo is the finish time of
-        the last step; Complete is $true when the plan reaches the newest backup
-        on disk.
+        Timestamp, Path, Paths, FirstLsn, LastLsn) and a .RestoreScript string of
+        the T-SQL RESTORE statements. RecoverableTo is the finish time of the
+        last step; Complete is $true when the plan reaches the newest backup on
+        disk.
     #>
     param(
         [object[]]$History = @(),
@@ -1580,13 +1582,19 @@ function Get-RestorePlan {
         $recs = @($grp.Group | Where-Object { -not $_.IsCopyOnly })
         $instance = if ($recs.Count -gt 0) { $recs[0].Instance } else { '' }
 
-        $pathOf = {
+        # The file(s) to RESTORE FROM: msdb's recorded device paths (covers a
+        # striped backup's members), unless the match said the file moved, in
+        # which case the on-disk MatchedPath is all we can trust.
+        $pathsOf = {
             param($r)
-            if ($r.PSObject.Properties['MatchedPath'] -and $r.MatchedPath) { return [string]$r.MatchedPath }
-            $dp = @($r.DevicePaths)
-            if ($dp.Count -gt 0) { return [string]$dp[0] }
-            return ''
+            $dp = @(@($r.DevicePaths) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+            $mp = if ($r.PSObject.Properties['MatchedPath'] -and $r.MatchedPath) { [string]$r.MatchedPath } else { $null }
+            if ($mp -and ($dp -notcontains $mp)) { return @($mp) }
+            if ($dp.Count -gt 0) { return $dp }
+            if ($mp) { return @($mp) }
+            return @()
         }
+        $pathOf = { param($r) $p = @(& $pathsOf $r); if ($p.Count -gt 0) { $p[0] } else { '' } }
 
         $onDiskAll = @($recs | Where-Object { $_.PSObject.Properties['OnDisk'] -and $_.OnDisk })
         $newestOnDisk = if ($onDiskAll.Count -gt 0) { @($onDiskAll | Sort-Object Timestamp)[-1] } else { $null }
@@ -1601,6 +1609,7 @@ function Get-RestorePlan {
                     RecoverableTo = $null
                     StepCount     = 0
                     Steps         = @()
+                    RestoreScript = ''
                     Reason        = 'No FULL backup file on disk - nothing to restore from.'
                 })
             continue
@@ -1614,7 +1623,7 @@ function Get-RestorePlan {
                 Order      = $order; Database = $db; BackupType = 'FULL'
                 Timestamp  = $base.Timestamp; FinishTime = $base.FinishTime
                 FirstLsn   = $base.FirstLsn; LastLsn = $base.LastLsn
-                Path       = (& $pathOf $base)
+                Path       = (& $pathOf $base); Paths = (& $pathsOf $base)
             })
 
         $anchor = $base.LastLsn
@@ -1631,7 +1640,7 @@ function Get-RestorePlan {
                     Order      = $order; Database = $db; BackupType = 'DIFF'
                     Timestamp  = $diff.Timestamp; FinishTime = $diff.FinishTime
                     FirstLsn   = $diff.FirstLsn; LastLsn = $diff.LastLsn
-                    Path       = (& $pathOf $diff)
+                    Path       = (& $pathOf $diff); Paths = (& $pathsOf $diff)
                 })
             if ($null -ne $diff.LastLsn) { $anchor = $diff.LastLsn }
             if ($diff.ForkGuid) { $anchorFork = $diff.ForkGuid }
@@ -1666,7 +1675,7 @@ function Get-RestorePlan {
                         Order      = $order; Database = $db; BackupType = 'LOG'
                         Timestamp  = $next.Timestamp; FinishTime = $next.FinishTime
                         FirstLsn   = $next.FirstLsn; LastLsn = $next.LastLsn
-                        Path       = (& $pathOf $next)
+                        Path       = (& $pathOf $next); Paths = (& $pathsOf $next)
                     })
                 $cursor = $next.LastLsn
                 if ($next.ForkGuid) { $curFork = $next.ForkGuid }
@@ -1687,6 +1696,19 @@ function Get-RestorePlan {
         elseif (-not $complete) { 'Plan is valid but a newer backup on disk was not reachable from this chain.' }
         else { '' }
 
+        # T-SQL: every restore NORECOVERY, then a trailing WITH RECOVERY when the
+        # chain is complete. Paths on a different server may need WITH MOVE.
+        $dbEsc = $db -replace ']', ']]'
+        $sql = New-Object System.Collections.Generic.List[string]
+        $sql.Add(('-- {0}  ->  recoverable to {1:yyyy-MM-dd HH:mm:ss}{2}' -f $db, $last.FinishTime, $(if ($complete) { '' } else { '  (chain incomplete)' })))
+        foreach ($s in $steps) {
+            $verb = if ($s.BackupType -eq 'LOG') { 'RESTORE LOG' } else { 'RESTORE DATABASE' }
+            $disks = @(@($s.Paths) | ForEach-Object { "DISK = N'{0}'" -f ($_ -replace "'", "''") }) -join ', '
+            $sql.Add(('{0} [{1}] FROM {2} WITH NORECOVERY;' -f $verb, $dbEsc, $disks))
+        }
+        if ($complete) { $sql.Add(('RESTORE DATABASE [{0}] WITH RECOVERY;' -f $dbEsc)) }
+        else { $sql.Add('-- chain incomplete - stay NORECOVERY and add the missing backups, or RESTORE DATABASE [...] WITH RECOVERY to stop here.') }
+
         $out.Add([pscustomobject]@{
                 PSTypeName    = 'BackupChainCheck.RestorePlan'
                 Instance      = $instance
@@ -1695,6 +1717,7 @@ function Get-RestorePlan {
                 RecoverableTo = $last.FinishTime
                 StepCount     = $steps.Count
                 Steps         = $steps.ToArray()
+                RestoreScript = ($sql -join [Environment]::NewLine)
                 Reason        = $reason
             })
     }
@@ -1726,6 +1749,10 @@ function Write-RestorePlan {
         $color = if ($p.Complete) { 'Green' } else { 'DarkYellow' }
         Write-Host ('  -> {0} step(s), recoverable to {1:yyyy-MM-dd HH:mm:ss}  [{2}]' -f $p.StepCount, $p.RecoverableTo, $tag) -ForegroundColor $color
         if ($p.Reason) { Write-Host "     $($p.Reason)" -ForegroundColor DarkYellow }
+        if ($p.RestoreScript) {
+            Write-Host ''
+            foreach ($line in ($p.RestoreScript -split "`r?`n")) { Write-Host "    $line" -ForegroundColor DarkGray }
+        }
     }
 }
 
