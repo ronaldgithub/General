@@ -62,6 +62,10 @@ databases so you can tell which case it is.
 - **LOG / DIFF chain gaps** – spacing between consecutive backups larger than
   `interval × GapToleranceFactor` (default 1.5), i.e. missing backups that break
   point-in-time recovery. All gaps for a database roll up into one finding.
+- **LSN chain** (`-SqlInstance`) – from `msdb` history: each LOG's `first_lsn`
+  equals the previous `last_lsn` (contiguous, one recovery fork), no `is_damaged`
+  backup, and no LOG recorded in `msdb` inside the on-disk chain window whose file
+  has gone missing. Reported as the `LSN valid` / `error` headline plus findings.
 - **Roll-forward coverage** – the oldest retained FULL has a LOG chain starting at
   or before it. `@CleanupTime` for LOG shorter than for FULL leaves your *oldest*
   full backups unrecoverable-forward.
@@ -181,13 +185,21 @@ finding tally:
 LSN valid  |  BackupChainCheck 2026-09-07 10:30  |  StackOverflow2010  |  @CleanupTime F/D/L 48/48/48h  |  files F/D/L 3/2/18  |  3E 4W 0I
 ```
 
-`LSN valid` / `error` / `n/a` comes from `Test-LsnChain`: with `-SqlInstance` it
-reads `msdb` history and checks that each LOG backup's `first_lsn` equals the
-previous one's `last_lsn` (a contiguous chain on one recovery fork), and that no
-backup is `is_damaged`. **Time gaps are not a break** — a database can sit idle
-for days with a perfectly intact chain, which is why this can read `valid` even
-when the file-spacing check reports "LOG chain gap". `n/a` means there was no
-`msdb` history to check (no `-SqlInstance`, or no LOG backups in the window).
+`LSN valid` / `error` / `n/a` (green / red / yellow on the console) comes from
+`Test-LsnChain`. With `-SqlInstance` it reads `msdb` history and checks that:
+
+- each LOG backup's `first_lsn` equals the previous one's `last_lsn` — a
+  contiguous chain on one recovery fork,
+- no backup is `is_damaged`,
+- and every LOG that `msdb` records **between the oldest and newest LOG that are
+  actually on disk** still has its `.trn` file — so a log deleted (or aged off
+  while its neighbours were kept) out of the middle of the retained chain is
+  caught, even though the recorded LSNs still line up.
+
+**Time gaps are not a break** — a database can sit idle for days with a perfectly
+intact chain, which is why this can read `valid` even when the file-spacing check
+reports "LOG chain gap". `n/a` means there was no `msdb` history to check (no
+`-SqlInstance`, or no LOG backups in the window).
 
 Each finding is then emitted as a `[pscustomobject]` on the pipeline so you can
 filter, export, or feed it into monitoring:

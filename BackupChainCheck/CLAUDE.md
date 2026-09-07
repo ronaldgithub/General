@@ -100,11 +100,15 @@ Internal structure of the script, in order:
   per-db → params) into `$model[db][type]` (also carries `ScheduleText` /
   `NextRun` when a schedule set the interval).
 - `Test-BackupChain` — the file/retention/cadence checks; emits `New-Finding`.
+- `Join-BackupSetToFile` — annotates each `Get-BackupSetHistory` record with
+  `OnDisk` / `MatchedPath` (device-path match, then db+type+timestamp fallback).
 - `Test-LsnChain` — LSN continuity of the LOG chain from `Get-BackupSetHistory`
   (each LOG `first_lsn` = previous `last_lsn`, one recovery fork, nothing
-  `is_damaged`, DIFF bases present). Time gaps are deliberately NOT breaks.
-  Returns `@{ Status = 'valid'|'error'|'n/a'; Findings }`; `Status` is the first
-  column of the `Get-RunSummary` line.
+  `is_damaged`, DIFF bases present) plus, with `-LogicalBackup`, a hole in the
+  on-disk chain (a recorded LOG between the oldest and newest on-disk LOG whose
+  own file is gone). Time gaps are deliberately NOT breaks. Returns
+  `@{ Status = 'valid'|'error'|'n/a'; Findings }`; `Status` is the first column
+  of the `Get-RunSummary` line (green / red / dark-yellow on the console).
 - `Get-BackupPrediction` / `Write-PredictionMatrix` — the `-Predict` mode.
   `Get-BackupPrediction` projects, per (database, type) with a known retention +
   interval, the backup slots that should be on disk now (one every interval, back

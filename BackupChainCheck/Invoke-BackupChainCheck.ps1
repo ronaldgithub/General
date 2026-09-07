@@ -1305,12 +1305,61 @@ function Test-BackupChain {
     return $findings
 }
 
+function Join-BackupSetToFile {
+    <#
+        Decides, for each msdb history record, whether its backup file is present
+        among the on-disk logical backups. Match on device path first (same box),
+        then on Database + BackupType + Timestamp within a few minutes (covers a
+        moved / UNC path). Adds .OnDisk and .MatchedPath to each record in place
+        and returns the collection.
+    #>
+    param(
+        [object[]]$History = @(),
+        [object[]]$LogicalBackup = @(),
+        [double]$ToleranceMinutes = 3
+    )
+
+    $diskPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($lb in $LogicalBackup) {
+        foreach ($p in @($lb.Paths)) {
+            if ($p) { [void]$diskPaths.Add((([string]$p) -replace '/', '\')) }
+        }
+    }
+
+    foreach ($h in $History) {
+        $onDisk = $false
+        $matched = $null
+
+        foreach ($dp in @($h.DevicePaths)) {
+            if (-not $dp) { continue }
+            if ($diskPaths.Contains((([string]$dp) -replace '/', '\'))) { $onDisk = $true; $matched = $dp; break }
+        }
+        if (-not $onDisk) {
+            foreach ($lb in $LogicalBackup) {
+                if ($lb.Database -ne $h.Database -or $lb.BackupType -ne $h.BackupType) { continue }
+                if ([math]::Abs(($lb.Timestamp - $h.Timestamp).TotalMinutes) -le $ToleranceMinutes) {
+                    $onDisk = $true
+                    $matched = @($lb.Paths)[0]
+                    break
+                }
+            }
+        }
+
+        $h | Add-Member -NotePropertyName OnDisk -NotePropertyValue $onDisk -Force
+        $h | Add-Member -NotePropertyName MatchedPath -NotePropertyValue $matched -Force
+    }
+    return $History
+}
+
 function Test-LsnChain {
     <#
         Validates LSN continuity of the LOG backup chain per database, from msdb
         history: each non-copy-only LOG backup's first_lsn must equal the previous
-        one's last_lsn, on a single recovery fork. Also flags damaged backups and
-        differentials whose base FULL is not in the history window.
+        one's last_lsn, on a single recovery fork. Also flags damaged backups,
+        differentials whose base FULL is not in the history window, and - when
+        -LogicalBackup is supplied - a hole in the on-disk chain: a LOG that msdb
+        records, between the oldest and newest LOG that ARE on disk, whose own
+        .trn file is gone (deleted, or aged off while its neighbours were kept).
 
         Time gaps are NOT a chain break - a database can sit idle for days with an
         intact chain. That is what separates this from the file-spacing check in
@@ -1320,12 +1369,16 @@ function Test-LsnChain {
     #>
     param(
         [object[]]$History = @(),
+        [object[]]$LogicalBackup = @(),
         [hashtable]$DatabaseInfo
     )
 
     $findings = New-Object System.Collections.Generic.List[object]
     $checked = $false
     $instanceLabel = if ($History.Count -gt 0) { $History[0].Instance } else { '' }
+
+    $checkDisk = $LogicalBackup.Count -gt 0
+    if ($checkDisk) { $null = Join-BackupSetToFile -History $History -LogicalBackup $LogicalBackup }
 
     foreach ($grp in ($History | Group-Object Database)) {
         $db = $grp.Name
@@ -1371,6 +1424,26 @@ function Test-LsnChain {
                             -Finding ('LSN recovery fork changed mid-chain ({0}x)' -f $forkCount) `
                             -Found ('first change after {0:yyyy-MM-dd HH:mm}' -f $firstBreak.Timestamp) `
                             -Detail 'A RESTORE ... WITH RECOVERY or point-in-time restore happened on this database - backups from before the fork cannot roll forward past it.'))
+            }
+        }
+
+        # A hole in the on-disk chain: a LOG that msdb records, sitting between the
+        # oldest and newest LOG that ARE on disk, whose own file is gone. That is a
+        # break you would only discover at restore time - the LSNs still line up.
+        if ($checkDisk) {
+            $diskLogs = @($logs | Where-Object { $_.OnDisk } | Sort-Object Timestamp)
+            if ($diskLogs.Count -ge 1) {
+                $lo = $diskLogs[0].Timestamp
+                $hi = $diskLogs[$diskLogs.Count - 1].Timestamp
+                $holes = @($logs | Where-Object { -not $_.OnDisk -and $_.Timestamp -ge $lo -and $_.Timestamp -le $hi } | Sort-Object Timestamp)
+                if ($holes.Count -gt 0) {
+                    $checked = $true
+                    $findings.Add((New-Finding -Instance $instanceLabel -Database $db -BackupType 'LOG' -Severity 'Error' `
+                                -Finding ('Restore chain has a hole - {0} LOG file(s) inside the on-disk chain are missing from disk' -f $holes.Count) `
+                                -Expected 'every LOG between the oldest and newest on-disk LOG still on disk' `
+                                -Found ('e.g. {0:yyyy-MM-dd HH:mm} recorded in msdb, file not found' -f $holes[0].Timestamp) `
+                                -Detail 'The LSN chain is intact in msdb but the .trn file is gone (deleted, or aged off while surrounding logs were kept). Point-in-time recovery cannot cross the hole - you can only roll forward to the last LOG whose file exists before it.'))
+                }
             }
         }
 
@@ -1804,7 +1877,7 @@ if ($logical.Count -eq 0) {
 
 $findings = Test-BackupChain -LogicalBackup $logical -Model $model -DatabaseInfo $dbInfo -CommandLog $commandLog -ToleranceFactor $GapToleranceFactor
 
-$lsn = Test-LsnChain -History $backupHistory -DatabaseInfo $dbInfo
+$lsn = Test-LsnChain -History $backupHistory -LogicalBackup $logical -DatabaseInfo $dbInfo
 Write-Verbose "LSN chain status: $($lsn.Status) ($($lsn.Findings.Count) finding(s))."
 if ($lsn.Findings.Count -gt 0) { $findings = @($findings) + @($lsn.Findings) }
 
@@ -1815,7 +1888,10 @@ Write-Verbose $summaryLine
 
 if (-not $Quiet) {
     Write-Host ''
-    Write-Host $summaryLine
+    $lsnColor = switch ($lsn.Status) { 'valid' { 'Green' } 'error' { 'Red' } default { 'DarkYellow' } }
+    $lsnPrefix = "LSN $($lsn.Status)"
+    Write-Host $lsnPrefix -ForegroundColor $lsnColor -NoNewline
+    Write-Host $summaryLine.Substring($lsnPrefix.Length)
     if ($sorted) {
         Write-Host ''
         $sorted | Group-Object Severity | ForEach-Object { Write-Host ("  {0,-8} {1}" -f $_.Name, $_.Count) }

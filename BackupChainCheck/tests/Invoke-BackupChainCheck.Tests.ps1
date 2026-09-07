@@ -266,19 +266,25 @@ Describe 'Group-BackupSetRow' {
 
 Describe 'Test-LsnChain' {
     function New-Hist {
-        param($Db, $Type, $Ts, $First, $Last, $Fork = 'F1', [switch]$Damaged, [switch]$Copy, $DiffBase)
+        param($Db, $Type, $Ts, $First, $Last, $Fork = 'F1', [switch]$Damaged, [switch]$Copy, $DiffBase, $Device)
         [pscustomobject]@{
             Instance            = 'I1'
             Database            = $Db
             BackupType          = $Type
             Timestamp           = [datetime]$Ts
+            FinishTime          = [datetime]$Ts
             FirstLsn            = if ($null -eq $First) { $null } else { [decimal]$First }
             LastLsn             = if ($null -eq $Last) { $null } else { [decimal]$Last }
             DifferentialBaseLsn = if ($null -eq $DiffBase) { $null } else { [decimal]$DiffBase }
             ForkGuid            = $Fork
             IsDamaged           = [bool]$Damaged
             IsCopyOnly          = [bool]$Copy
+            DevicePaths         = if ($null -eq $Device) { @() } else { @($Device) }
         }
+    }
+    function New-DiskLb {
+        param($Db, $Type, $Ts, $Path)
+        [pscustomobject]@{ Database = $Db; BackupType = $Type; Timestamp = [datetime]$Ts; Paths = @($Path) }
     }
 
     It 'reports a contiguous log chain as valid (time gaps do not matter)' {
@@ -339,6 +345,64 @@ Describe 'Test-LsnChain' {
         $r = Test-LsnChain -History $h
         $r.Status | Should Be 'valid'
         (@($r.Findings | Where-Object { $_.Severity -eq 'Warning' }).Count) | Should Be 1
+    }
+
+    It 'errors on a hole in the on-disk chain (a recorded LOG whose file was deleted)' {
+        $h = @(
+            (New-Hist 'DB1' 'LOG' '2026-09-07 07:00' 100 200 'F1' -Device 'E:\b\DB1\LOG\l1.trn'),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 200 300 'F1' -Device 'E:\b\DB1\LOG\l2.trn'),   # file deleted
+            (New-Hist 'DB1' 'LOG' '2026-09-07 09:00' 300 400 'F1' -Device 'E:\b\DB1\LOG\l3.trn')
+        )
+        $disk = @(
+            (New-DiskLb 'DB1' 'LOG' '2026-09-07 07:00' 'E:\b\DB1\LOG\l1.trn'),
+            (New-DiskLb 'DB1' 'LOG' '2026-09-07 09:00' 'E:\b\DB1\LOG\l3.trn')
+        )
+        $r = Test-LsnChain -History $h -LogicalBackup $disk
+        $r.Status | Should Be 'error'
+        (@($r.Findings | Where-Object { $_.Finding -like 'Restore chain has a hole*' }).Count) | Should Be 1
+    }
+
+    It 'stays valid when every recorded LOG inside the on-disk range is present' {
+        $h = @(
+            (New-Hist 'DB1' 'LOG' '2026-09-07 07:00' 100 200 'F1' -Device 'E:\b\DB1\LOG\l1.trn'),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 200 300 'F1' -Device 'E:\b\DB1\LOG\l2.trn')
+        )
+        $disk = @(
+            (New-DiskLb 'DB1' 'LOG' '2026-09-07 07:00' 'E:\b\DB1\LOG\l1.trn'),
+            (New-DiskLb 'DB1' 'LOG' '2026-09-07 08:00' 'E:\b\DB1\LOG\l2.trn')
+        )
+        (Test-LsnChain -History $h -LogicalBackup $disk).Status | Should Be 'valid'
+    }
+
+    It 'does not flag an old LOG below the on-disk chain range (retention aged it off)' {
+        $h = @(
+            (New-Hist 'DB1' 'LOG' '2026-09-01 07:00' 100 200 'F1' -Device 'E:\b\DB1\LOG\old.trn'),   # aged off disk
+            (New-Hist 'DB1' 'LOG' '2026-09-07 07:00' 200 300 'F1' -Device 'E:\b\DB1\LOG\l1.trn'),
+            (New-Hist 'DB1' 'LOG' '2026-09-07 08:00' 300 400 'F1' -Device 'E:\b\DB1\LOG\l2.trn')
+        )
+        $disk = @(
+            (New-DiskLb 'DB1' 'LOG' '2026-09-07 07:00' 'E:\b\DB1\LOG\l1.trn'),
+            (New-DiskLb 'DB1' 'LOG' '2026-09-07 08:00' 'E:\b\DB1\LOG\l2.trn')
+        )
+        (Test-LsnChain -History $h -LogicalBackup $disk).Status | Should Be 'valid'
+    }
+}
+
+Describe 'Join-BackupSetToFile' {
+    It 'matches on device path and flags a missing file' {
+        $h = @(
+            [pscustomobject]@{ Database = 'DB1'; BackupType = 'LOG'; Timestamp = [datetime]'2026-09-07 07:00'; DevicePaths = @('E:\b\l1.trn') },
+            [pscustomobject]@{ Database = 'DB1'; BackupType = 'LOG'; Timestamp = [datetime]'2026-09-07 08:00'; DevicePaths = @('E:\b\l2.trn') }
+        )
+        $disk = @([pscustomobject]@{ Database = 'DB1'; BackupType = 'LOG'; Timestamp = [datetime]'2026-09-07 07:00'; Paths = @('E:\b\l1.trn') })
+        $r = @(Join-BackupSetToFile -History $h -LogicalBackup $disk)
+        $r[0].OnDisk | Should Be $true
+        $r[1].OnDisk | Should Be $false
+    }
+    It 'falls back to database + type + timestamp when the path differs' {
+        $h = @([pscustomobject]@{ Database = 'DB1'; BackupType = 'LOG'; Timestamp = [datetime]'2026-09-07 07:00:30'; DevicePaths = @('E:\local\l1.trn') })
+        $disk = @([pscustomobject]@{ Database = 'DB1'; BackupType = 'LOG'; Timestamp = [datetime]'2026-09-07 07:00:00'; Paths = @('\\nas\share\l1.trn') })
+        (@(Join-BackupSetToFile -History $h -LogicalBackup $disk))[0].OnDisk | Should Be $true
     }
 }
 
