@@ -31,18 +31,40 @@ Yes — and it is exactly the kind of thing this tool flags.
 older than N hours."* (With `@CleanupMode = 'AFTER_BACKUP'`, the default, the delete
 is skipped entirely if the backup fails.)
 
-So retention + cadence imply an **expected file count**:
+So retention + cadence imply an **expected file count**. Put the backups on an age
+axis — one every `Interval` hours, newest at age ~0 — and retention keeps every one
+younger than `Cleanup`:
 
 ```
+age →   0         I         2I         3I
+        |         |         |          ·         ( · = deleted, age > Cleanup )
+       now      −1 bkp    −2 bkp
+        └─────────── Cleanup window ────────────┘
+
 expected files per (database, backup type) ≈ floor(CleanupTime / IntervalHours) + 1
                                              (× @NumberOfFiles if the backup is striped)
 ```
 
-| Setting                        | Interval | Expected FULL files |
-|--------------------------------|----------|---------------------|
-| `@CleanupTime = 48`, daily FULL | 24 h     | `floor(48/24) + 1` = **3** |
-| `@CleanupTime = 24`, daily FULL | 24 h     | **2** (and briefly 1 right after cleanup) |
-| `@CleanupTime = 48`, weekly FULL | 168 h   | **1** – by design, but a single-copy risk |
+`CleanupTime / Interval` is how many one-interval **gaps** fit in the window;
+`floor` drops the partial gap at the end; **`+ 1`** is the fencepost — N gaps have
+N+1 backups, counting the fresh one at age 0 *and* the oldest still inside the
+window.
+
+| Setting                           | Interval | Files, at ages   | Expected                                  |
+|-----------------------------------|----------|------------------|-------------------------------------------|
+| `@CleanupTime = 48`, daily FULL   | 24 h     | 0 h, 24 h, 48 h  | **3**                                     |
+| `@CleanupTime = 72`, daily FULL   | 24 h     | 0, 24, 48, 72 h  | **4**                                     |
+| `@CleanupTime = 24`, daily FULL   | 24 h     | 0 h, 24 h        | **2** (briefly 1 right after cleanup)     |
+| `@CleanupTime = 168`, weekly FULL | 168 h    | 0 h              | **1** – by design, but a single-copy risk |
+
+**Two numbers, on purpose.** That last file — the one sitting right at age ≈
+`Cleanup` — is not guaranteed. Cleanup only runs *at* a backup, with a cutoff set
+`Cleanup` hours before *that*, so between runs the oldest survivor can reach age
+`Cleanup + Interval`, and when `Cleanup` is an exact multiple of `Interval` it
+balances on the edge — a slightly-long run deletes it, a slightly-short one keeps
+it. So the tool treats **`floor(C/I)`** as the guaranteed floor and
+**`floor(C/I) + 1`** as a healthy just-cleaned chain. Finding fewer than
+`floor(C/I)` is the real problem.
 
 Finding **1** file where the math says **3** means one of:
 
@@ -360,12 +382,110 @@ The timestamp in the file name is used as the backup time; `@NumberOfFiles > 1`
 
 ---
 
+## Recommended settings
+
+- **Production: keep `@CleanupMode = 'AFTER_BACKUP'`** (Ola's default) —
+  *"delete old backup files after the backup and verification have been performed.
+  If the backup or verify fails, then no backup files are deleted."* A failed run
+  aborts the job step before the cleanup step, so a bad backup can never leave you
+  with fewer (or zero) usable copies. `BEFORE_BACKUP` deletes first, so a failure
+  right after can wipe your safety net — this tool flags it as a `Warning`.
+- **Other OTAP environments: your call.** If disk space is the constraint, prefer
+  backup compression over a shorter `@CleanupTime` —
+  see [SQL Server backup/restore compression options](https://dbaronald.nl/sql-server-2025-backup-restore-with-compression-options/).
+
+---
+
+## How `@CleanupTime` actually deletes files
+
+`@CleanupTime` is an integer number of **hours**. Ola turns it into a cutoff and
+deletes anything older:
+
+```
+@CleanupDate = DATEADD(hh, -@CleanupTime, GETDATE())
+```
+
+Three things decide what "older" means:
+
+| Question | Answer |
+| --- | --- |
+| When is `GETDATE()` sampled? | Per **database**, at the moment that database's cleanup command runs — not once for the whole job. In a job that backs up 60 databases over 40 minutes, the last database's cutoff is ~40 min later than the first's. |
+| `@CleanupMode = 'AFTER_BACKUP'` (default) | Cleanup runs **right after that database's backup finishes** → cutoff ≈ backup *end* time. Skipped entirely if the backup/verify failed. |
+| `@CleanupMode = 'BEFORE_BACKUP'` | Cleanup runs **before that database's backup starts** → cutoff ≈ backup *start* time. |
+| Which date on the old file is compared? | The **backup-set finish date stored inside the file header** — *not* the filesystem `LastWriteTime`, *not* the timestamp in the file name. |
+
+Ola deletes via `xp_delete_file` (or `xp_delete_files` on newer builds):
+
+```sql
+EXECUTE master.dbo.xp_delete_file 0, N'<dir>', N'bak', N'<@CleanupDate>', <subfolder-bit>
+```
+
+The first argument `0` means *backup files*: for that mode the proc opens each
+candidate, reads the MTF media header, and uses the **backup finish date recorded
+in the backup set** as the file's age. So:
+
+- A `.bak` with an unreadable/corrupt header, or a non-backup file, is skipped —
+  not deleted.
+- Only the exact extension in the exact `(database, backup type)` directory Ola
+  built is considered — FULL cleanup never touches `.trn`, and vice versa.
+- If the Agent service account cannot delete on the target (UNC permissions,
+  read-only share), `xp_delete_file` fails quietly and old files pile up — the
+  "stale / orphan files" case this tool flags.
+- Ola generates the **file-name** timestamp at backup *start*; the **header**
+  finish date is when it *completed*. For a FULL that runs 02:00→02:47 those
+  differ by 47 minutes, and cleanup compares against `02:47`.
+
+**How this tool approximates it:** BackupChainCheck has no header date without a
+SQL connection, so it ages each file from its **file-name timestamp** against the
+run time, and treats a file as past retention at roughly
+`@CleanupTime + one interval`. That absorbs both the per-database cutoff drift and
+the start-vs-finish spread, at the cost of precision — which is why a difference of
+a few minutes to a couple of hours around the boundary is not meaningful. With
+`-SqlInstance` the real `backup_finish_date` is available from `msdb` and used for
+the LSN-chain checks.
+
+### Does the retention boundary wobble between runs?
+
+Yes — but it is *bounded, self-correcting* jitter, not open-ended drift.
+
+- **Fixed:** the header finish-date on every backup file already on disk. That is
+  history; it never changes. The candidate set is deterministic.
+- **Moves:** only the cutoff line (`now − @CleanupTime`), because "now" is sampled
+  per database when that database's cleanup step runs. It shifts with the
+  database's position in the run order, how long every backup *ahead* of it took,
+  and — under `AFTER_BACKUP` — how long *its own* backup took (cutoff = its
+  finish). `@DatabasesInParallel = 'Y'` and a non-default `@DatabaseOrder`
+  (`DATABASE_SIZE_DESC`, …) add more movement. The spread is roughly the job
+  step's total runtime — usually minutes to an hour or two.
+
+So it is a fuzzy boundary sweeping across a fixed set of files. It only changes
+the outcome when `@CleanupTime` is close to a whole multiple of the interval:
+
+- **`@CleanupTime` ≈ N × interval** (e.g. 24h retention, 24h cadence): the oldest
+  copy sits on the edge. A fast run keeps it (2 copies); a slow run deletes it
+  (1 copy). The count oscillates run to run from duration alone — the "not a whole
+  multiple → count oscillates" / "below cadence → zero copies" cases `-Advice`
+  flags.
+- **A large database with variable backup duration**: under `AFTER_BACKUP` its
+  window slides forward by its own backup time each run.
+
+Away from that edge the nearest older file is a full interval beyond the boundary,
+so a ±1h wobble cannot reach it. And nothing is lost: a file that survives one run
+because the cutoff landed early is deleted the next cycle once the cutoff advances
+past it — worst case it lingers one extra cycle, or a slow run drops you by one
+copy transiently and recovers.
+
+**Takeaway:** give `@CleanupTime` at least one full interval of headroom above the
+bare minimum (whole multiple **plus margin**) and the boundary jitter never
+crosses a real file.
+
+---
+
 ## Caveats
 
-- **`xp_delete_file` uses the backup header date, not the file's timestamp.** Ola's
-  cleanup reads the media/backup-set date embedded in each file, which can differ
-  from the filesystem `LastWriteTime` this tool sees. They are normally close, but
-  don't treat a few-minutes difference as meaningful.
+- **Cleanup uses the backup header date, not the file's timestamp** — see the
+  section above. A few minutes' to a couple of hours' difference around the
+  retention boundary is expected and not meaningful.
 - **Cleanup is skipped on failure** (`AFTER_BACKUP` mode), so a *pile-up* of old
   files usually means past backup failures, not a retention bug.
 - **`@CopyOnly = 'Y'` backups** land in a separate folder and are not governed by
