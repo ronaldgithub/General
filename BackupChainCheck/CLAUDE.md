@@ -10,8 +10,10 @@ against the backup files actually present on disk, and reports recovery-coverage
 gaps. See `README.md` for the functional design and the reconciliation math.
 
 Core rule: **the tool must never write to SQL Server and never delete or modify
-backup files.** Every SQL query is read-only against `msdb`. Every filesystem
-operation is enumeration only.
+backup files.** Every SQL query is a read-only `SELECT` against `msdb`,
+`sys.databases` / `master`, and `<SolutionDatabase>.dbo.CommandLog`. No
+`RESTORE`, not even `VERIFYONLY` (verify results are read from `CommandLog`).
+Every filesystem operation is enumeration only.
 
 ## Runtime target: Windows PowerShell 5.1 only
 
@@ -58,28 +60,129 @@ Invoke-BackupChainCheck.ps1              The whole tool. param() block, helper
                                          Returns early when dot-sourced
                                          (InvocationName -eq '.') so tests can
                                          load the functions without running it.
+BackupChainCheck.Format.ps1xml           Default TableControl views for the emitted
+                                         BackupChainCheck.Finding / .Prediction /
+                                         .RestorePlan / .RestoreStep objects.
+                                         Loaded via Update-FormatData at
+                                         script start (guarded - the script still
+                                         works if it is missing). Optional polish,
+                                         not a second code file.
 expectations.sample.json                 Template for -ConfigPath.
 tests/Invoke-BackupChainCheck.Tests.ps1  Pester tests (parsing + math), no SQL.
 ```
 
 Internal structure of the script, in order:
 
-- `New-Finding` / `Get-DurationText` / `Get-Median` — small helpers.
+- `New-Finding` (tags output `BackupChainCheck.Finding`) / `Get-DurationText` /
+  `Get-DataSizeText` / `Get-Median` / `Get-RunSummary` (the one-line header) —
+  small helpers.
 - `ConvertFrom-OlaBackupFile` — one FileInfo (or stand-in) → parsed record.
   Directory structure trusted first, file name is the fallback.
 - `Get-BackupFileInventory` / `Group-LogicalBackup` — scan + collapse striping.
 - `Invoke-SqlQuery` — thin read-only ADO.NET helper.
 - `Get-OlaJobConfig` — regex `@CleanupTime` / `@CleanupMode` / `@NumberOfFiles` /
   `@BackupType` / `@Databases` / `@Directory` out of `msdb.dbo.sysjobsteps`.
+- `Get-OlaJobSchedule` — the SQL Agent schedule(s) on each DatabaseBackup job
+  (`sysschedules` + `sysjobschedules`), turned into an intended interval + text +
+  next-run time per (backup type, scope). `ConvertTo-ScheduleInterval` /
+  `ConvertFrom-AgentTime` do the `freq_*` decoding (pure, tested).
 - `Get-OlaCommandLog` — `BACKUP_DATABASE` / `BACKUP_LOG` rows from
-  `<SolutionDatabase>.dbo.CommandLog`; returns `$null` if the table is absent.
+  `<SolutionDatabase>.dbo.CommandLog`; returns `$null` if the table is absent,
+  otherwise a plain array (never a `-NoEnumerate` `List` — that trips an ETS
+  binder bug in the caller's `@(...)`).
+- `Get-BackupSetHistory` / `Group-BackupSetRow` — `msdb.dbo.backupset` +
+  `backupmediafamily` + `backupmediaset` for D/I/L backups, one record per
+  logical backup with its LSN chain fields (`FirstLsn` … `DifferentialBaseLsn`,
+  kept as `[decimal]` — never `[double]`), recovery-fork guids, damage/verify
+  flags, stripe device paths, and size/throughput (`BackupSizeBytes`,
+  `CompressedSizeBytes`, `DurationSeconds`, `SpeedMBps` = `backup_size / run
+  time`, `$null` under a second). `Group-BackupSetRow` is the pure shaper the
+  tests drive with stand-in rows. LSN/bool marshalling helpers:
+  `ConvertTo-LsnDecimal`, `ConvertTo-NullableBool`.
 - `Get-SqlDatabaseInfo` — `sys.databases` recovery model / state / last backup.
+  Main then drops databases that are not present + ONLINE here (stale
+  `CommandLog` / orphaned files) unless `-IncludeOfflineDatabases`.
 - `Expand-DatabaseScope` — Ola `@Databases` token → concrete database list.
-- `Get-ExpectationModel` — layers interval (files → CommandLog → config → params)
-  and retention (config defaults → job → config per-db → params) into
-  `$model[db][type]`.
-- `Test-BackupChain` — every check; emits `New-Finding` objects.
+- `Get-ExpectationModel` — layers interval (files → CommandLog → SQL Agent
+  schedule → config → params) and retention (config defaults → job → config
+  per-db → params) into `$model[db][type]` (also carries `ScheduleText` /
+  `NextRun` when a schedule set the interval).
+- `Test-BackupChain` — the file/retention/cadence checks; emits `New-Finding`.
+- `Join-BackupSetToFile` — annotates each `Get-BackupSetHistory` record with
+  `OnDisk` / `MatchedPath` (device-path match, then db+type+timestamp fallback).
+- `Test-LsnChain` — LSN continuity of the LOG chain from `Get-BackupSetHistory`
+  (each LOG `first_lsn` = previous `last_lsn`, one recovery fork, nothing
+  `is_damaged`, DIFF bases present) plus, with `-LogicalBackup`, a hole in the
+  on-disk chain (a recorded LOG between the oldest and newest on-disk LOG whose
+  own file is gone) and a chain with no FULL backup file left on disk to restore
+  first. Time gaps are deliberately NOT breaks. Returns
+  `@{ Status = 'valid'|'error'|'n/a'; Findings }`; `Status` is the first column
+  of the `Get-RunSummary` line (green / red / dark-yellow on the console).
+- `Get-BackupAdvice` — the `-Advice` mode: plain-language notes on the retention
+  / cadence design (DIFF kept longer than FULL, LOG shorter than FULL, cleanup
+  below cadence, thin FULL copy count), grouped by identical settings, plus an
+  approximate wasted-space figure (files past retention + orphaned diffs, summing
+  `SizeBytes` from `Group-LogicalBackup`). Pure; console-only in Main.
+- `Write-ChainGraph` — the `-Graph` mode: an ASCII timeline per (database, type)
+  from the annotated history (or files), `|` per backup, `X` for a missing file,
+  `~~[dur]~~` / `//gap//` / `//fork//` between. LSN-break markers are LOG-only.
+  `X` (and its "file [name] missing" note) is only drawn inside the retention
+  window — age `<= CleanupHours + IntervalHours`; older missing records aged out
+  and render as `|`. Unknown retention flags every gap.
+- `Get-BackupPrediction` / `Write-PredictionMatrix` — the `-Predict` mode.
+  `Get-BackupPrediction` projects, per (database, type) with a known retention +
+  interval, the backup slots that should be on disk now (one every interval, back
+  to age `Cleanup + Interval`), greedily matches each to the closest unclaimed
+  actual within half an interval, and emits a `BackupChainCheck.Prediction`
+  record with a `.Slots` breakdown (and `SpeedMBps` — the median
+  `Get-BackupSetHistory` throughput for that database + type; the `MB/s` column
+  in the emitted table). Pure; takes `-History` and `-Now` for testability.
+- `Get-RestorePlan` / `Write-RestorePlan` — the `-RestorePlan` mode: per database,
+  the shortest sequence of backup FILES ON DISK that forms a valid LSN chain to
+  the newest recoverable point (newest on-disk FULL → newest on-disk DIFF whose
+  `DifferentialBaseLsn` = that FULL's `FirstLsn` → contiguous on-disk LOGs from
+  the anchor LSN forward). Pure; reads the `Join-BackupSetToFile`-annotated
+  history (LSNs are only in msdb). Emits `BackupChainCheck.RestorePlan` (with a
+  `.Steps` array of `BackupChainCheck.RestoreStep` and a `.RestoreScript` string
+  of the T-SQL `RESTORE … WITH NORECOVERY` statements + trailing `WITH RECOVERY`
+  when complete; striped backups list every `DISK =` member), `Complete` false +
+  `Reason` when a link's file is gone. Needs `-SqlInstance`.
+- `Test-DatabaseMatch` — `-Database` wildcard filter (`-like`, `*` = all).
 - `Write-HtmlReport`.
+
+**Watch the switch/local-variable name clash:** the `-RestorePlan` switch param
+and any `$restorePlan` local are the same variable (PowerShell is
+case-insensitive) — Main uses `$restorePlans` for the result to avoid clobbering
+the switch. Same trap waits for any future `$predict` / `$graph` / `$advice`.
+
+`#region Main`, in order: load config → scan files → (`-SqlInstance`) read job
+config, schedule, `CommandLog`, backup history → drop non-ONLINE / dropped
+databases unless `-IncludeOfflineDatabases` → apply `-Database` scope →
+`Get-ExpectationModel` → `Test-BackupChain` → `Join-BackupSetToFile` (annotate
+history once) → `Test-LsnChain` → merge findings → `Get-RunSummary` +
+console/`-Predict`/`-Graph`/`-RestorePlan` output → HTML report → emit pipeline
+objects (predictions under `-Predict`, restore plans under `-RestorePlan`, else
+findings) → `-FailOnGap` exit code.
+
+`-JustLSN` prints **one `Get-RunSummary` line per in-scope database** (each with
+its own per-db `Test-LsnChain` verdict, colour by status) and suppresses
+everything else — the findings breakdown, every `-Advice`/`-Predict`/`-Graph`/
+`-RestorePlan` view, the warning stream (unless `-WarningAction` is bound), **and
+the pipeline emit** (the final `if/elseif` block skips output entirely under
+`$JustLSN`, so the default `.Finding` table view does not render). Per-db lines
+loop `$model.Keys`; the shared `$writeSummaryLine` scriptblock locates the
+`LSN <status>` token with `IndexOf` (it is not at column 0 once `-InstancePrefix`
+prepends the `<server> / <db>` key). `-FailOnGap` still works (reads `$findings`, not
+the pipeline). `-Quiet` wins (Main clears `$JustLSN` when both set). Gate any new
+console block on `-not $Quiet -and -not $JustLSN`.
+
+`-Database` is normalised at the top of Main: every element is split on `,` and
+trimmed, so `-Database 'A,B'` (one quoted Ola-style list) and `-Database A,B`
+(two array elements) behave identically. Under `-JustLSN`, `Get-RunSummary` is called
+with `-InstancePrefix` (server + database key) so the line reads
+`<server>  <db>  |  LSN <status>  |  …` with no repeated scope field — which is
+why the console colouring locates the `LSN <status>` token with `IndexOf` rather
+than assuming it starts the string.
 
 **A future module split** (`BackupChainCheck.psd1` + `.psm1` + `src/` with one
 public function per file, `docs/ola-conventions.md`) is fine to do later, but keep
@@ -91,6 +194,11 @@ the single-script entry point working — it is what the README documents.
   comment-based help, typed + validated parameters, pipeline-friendly.
 - Emit **objects, not text**. No `Write-Host` for data; use `Write-Verbose`,
   `Write-Warning`, `Write-Error` for diagnostics and the pipeline for results.
+  The exception is the deliberate human-facing console views — `Get-RunSummary`,
+  `Write-PredictionMatrix`, `Write-ChainGraph`, the findings table — which
+  `Write-Host` under `-not $Quiet` *in addition to* the pipeline objects, never
+  instead of them. `BackupChainCheck.Format.ps1xml` gives the pipeline objects
+  their default table view.
 - Findings are `[pscustomobject]` with a stable shape:
   `Instance, Database, BackupType, Severity ('Error'|'Warning'|'Info'), Finding, Expected, Found, Detail`.
 - SQL access is plain ADO.NET (`System.Data.SqlClient`) via `Invoke-SqlQuery`.

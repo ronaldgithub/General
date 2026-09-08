@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Default table views for the objects Invoke-BackupChainCheck.ps1 emits, so a
+  bare run prints a readable grid instead of a per-object property list.
+  Loaded by the script with Update-FormatData; every property is still there
+  (Format-List * / Select-Object * show the lot).
+-->
+<Configuration>
+  <ViewDefinitions>
+
+    <View>
+      <Name>BackupChainCheck.Finding</Name>
+      <ViewSelectedBy>
+        <TypeName>BackupChainCheck.Finding</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Severity</Label><Width>8</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Database</Label><Width>18</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Type</Label><Width>4</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Finding</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Expected</Label><Width>20</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Found</Label><Width>18</Width></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Severity</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Database</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>BackupType</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Finding</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Expected</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Found</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <View>
+      <Name>BackupChainCheck.Prediction</Name>
+      <ViewSelectedBy>
+        <TypeName>BackupChainCheck.Prediction</TypeName>
+      </ViewSelectedBy>
+      <GroupBy>
+        <PropertyName>Database</PropertyName>
+        <Label>Database</Label>
+      </GroupBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Type</Label><Width>5</Width></TableColumnHeader>
+          <TableColumnHeader><Label>MB/s</Label><Width>7</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>Schedule</Label><Width>16</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Interval</Label><Width>9</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>Cleanup</Label><Width>8</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>Expected</Label><Width>9</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>Present</Label><Width>8</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>Missing</Label><Width>8</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>OffSched</Label><Width>9</Width><Alignment>Right</Alignment></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>BackupType</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($null -ne $_.SpeedMBps) { '{0:N1}' -f $_.SpeedMBps } else { '' }</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>Schedule</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>IntervalHours</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>CleanupHours</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>ExpectedCount</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>PresentCount</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>MissingCount</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>OffScheduleCount</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <View>
+      <Name>BackupChainCheck.RestorePlan</Name>
+      <ViewSelectedBy>
+        <TypeName>BackupChainCheck.RestorePlan</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Database</Label><Width>24</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Steps</Label><Width>5</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>RecoverableTo</Label><Width>19</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Complete</Label><Width>8</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Reason</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Database</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>StepCount</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($_.RecoverableTo) { '{0:yyyy-MM-dd HH:mm:ss}' -f $_.RecoverableTo } else { '' }</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>Complete</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Reason</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <View>
+      <Name>BackupChainCheck.RestoreStep</Name>
+      <ViewSelectedBy>
+        <TypeName>BackupChainCheck.RestoreStep</TypeName>
+      </ViewSelectedBy>
+      <GroupBy>
+        <PropertyName>Database</PropertyName>
+        <Label>Database</Label>
+      </GroupBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>#</Label><Width>3</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>Type</Label><Width>4</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Timestamp</Label><Width>19</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Path</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Order</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>BackupType</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>'{0:yyyy-MM-dd HH:mm:ss}' -f $_.Timestamp</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>Path</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+  </ViewDefinitions>
+</Configuration>
