@@ -129,6 +129,73 @@ Describe 'Get-RunSummary' {
         ($l2 -like '*2 databases*') | Should Be $true
         ($l2 -like '*F/D/L 48-168/?/?h*') | Should Be $true
     }
+    It 'with -InstancePrefix leads with server + scope and drops the standalone scope field' {
+        $p = Get-RunSummary -Now ([datetime]'2026-09-07 10:20:00') -Logical $logical -Model $model -Finding $findings -LsnStatus 'valid' -InstancePrefix 'WIN10'
+        ($p -like 'WIN10  DB1  |  LSN valid  |  BackupChainCheck 2026-09-07 10:20*') | Should Be $true
+        ($p -like '*@CleanupTime F/D/L 72/48/?h*') | Should Be $true
+        # scope 'DB1' appears once (in the key), not again as its own '|'-field
+        ([regex]::Matches($p, 'DB1').Count) | Should Be 1
+    }
+}
+
+Describe 'JustLSN switch (end to end)' {
+    $empty = Join-Path $env:TEMP ('bcc_justlsn_' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $empty | Out-Null
+
+    try {
+        # Write-Host lands on the information stream (6) in 5.1; merge it and the
+        # warning stream (3) into output and read them back as text.
+        $captured = & $scriptPath -BackupPath $empty -JustLSN 6>&1 3>&1
+        # The summary is written as three coloured Write-Host calls (LSN / status /
+        # rest) with -NoNewline, so stream capture sees the pieces; joined they are
+        # the single console line, with no other output around it.
+        $text = ($captured | ForEach-Object { "$_" }) -join ''
+
+        It 'emits only the one-line run summary, led with the server + database key' {
+            ($text -like "$env:COMPUTERNAME  no databases  |  LSN n/a  |  BackupChainCheck *  |  *files F/D/L 0/0/0*") | Should Be $true
+            ($text -match "`n") | Should Be $false
+        }
+        It 'does not repeat the scope as its own field' {
+            # exactly one '  |  ' between the key and 'LSN', none reintroducing scope
+            ($text -match 'BackupChainCheck [\d\- :]+  \|  @CleanupTime') | Should Be $true
+        }
+        It 'does not print the findings breakdown or the no-findings line' {
+            ($text -match 'No findings') | Should Be $false
+        }
+        It 'emits nothing on the pipeline (success stream is empty)' {
+            $obj = @(& $scriptPath -BackupPath $empty -JustLSN 6>$null 3>$null)
+            $obj.Count | Should Be 0
+        }
+    }
+    finally {
+        Remove-Item $empty -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Describe 'JustLSN - one line per database, comma-list -Database' {
+    $root = Join-Path $env:TEMP ('bcc_perdb_' + [guid]::NewGuid().ToString('N'))
+    foreach ($db in 'DB_A', 'DB_B') {
+        $dir = Join-Path $root "WIN10\$db\FULL"
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Set-Content -Path (Join-Path $dir "WIN10_${db}_FULL_20260901_120000.bak") -Value 'x'
+    }
+
+    try {
+        # single quoted comma list must resolve to both databases (Ola @Databases style)
+        $captured = & $scriptPath -BackupPath $root -Database 'DB_A,DB_B' -JustLSN 6>&1 3>&1
+        $text = ($captured | ForEach-Object { "$_" }) -join ''
+
+        It 'prints one summary line per database' {
+            ([regex]::Matches($text, 'BackupChainCheck').Count) | Should Be 2
+        }
+        It 'keys each line with the file-tree instance and the database' {
+            ($text -like '*WIN10  DB_A  |  LSN *') | Should Be $true
+            ($text -like '*WIN10  DB_B  |  LSN *') | Should Be $true
+        }
+    }
+    finally {
+        Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Describe 'Get-DataSizeText' {

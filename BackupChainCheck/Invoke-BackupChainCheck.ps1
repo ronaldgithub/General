@@ -34,7 +34,9 @@
 .PARAMETER Database
     One or more database-name wildcard patterns to limit the analysis (and the
     findings) to. Default '*' - every database. Matching is -like, e.g.
-    -Database StackOverflow2010  or  -Database 'JDE_*','ODS'.
+    -Database StackOverflow2010  or  -Database 'JDE_*','ODS'. A single
+    comma-separated string is also accepted (Ola's @Databases style):
+    -Database 'StackOverflow2010,StackOverflow2013' is split into two patterns.
 
 .PARAMETER SqlInstance
     Optional. SQL Server instance to read DatabaseBackup job configuration and
@@ -126,6 +128,21 @@
     for backup files on disk that are past @CleanupTime or have no restore base.
     Grouped so an ALL_DATABASES job is stated once. Console only.
 
+.PARAMETER JustLSN
+    Print ONE run-summary line PER in-scope database and nothing else - no findings
+    breakdown, no -Advice / -Predict / -Graph / -RestorePlan console output, and
+    job/path warnings are silenced (unless -WarningAction is set). Each line is led
+    with the server and database as a greppable key and carries that database's
+    own LSN verdict, @CleanupTime, file counts and finding tally:
+
+        WIN10  StackOverflow2010  |  LSN valid  |  BackupChainCheck 2026-09-08 16:44  |  @CleanupTime F/D/L 24/24/24h  |  files F/D/L 2/1/2  |  clean
+        WIN10  StackOverflow2013  |  LSN error  |  BackupChainCheck 2026-09-08 16:44  |  @CleanupTime F/D/L 24/24/24h  |  files F/D/L 1/0/3  |  1E 2W 0I
+
+    The server name is -SqlInstance, else the instance parsed from the backup file
+    tree, else this host's name. Nothing is emitted on the pipeline - the lines
+    are the entire output; -FailOnGap still sets the exit code. Ignored when
+    combined with -Quiet.
+
 .PARAMETER Quiet
     Suppress the console table (the pipeline objects are still returned).
 
@@ -192,6 +209,8 @@ param(
     [switch]$RestorePlan,
 
     [switch]$Advice,
+
+    [switch]$JustLSN,
 
     [switch]$Quiet
 )
@@ -348,13 +367,18 @@ function Get-RunSummary {
         A single one-line header: run time, scope, @CleanupTime per type (a range
         when it differs across the scoped databases, '?' when unknown), the count
         of FULL / DIFF / LOG files present, and the finding tally.
+
+        -InstancePrefix (the -JustLSN form) leads the line with
+        '<server>  <scope>  |  ' and drops the standalone scope field so the name
+        is not repeated - a greppable key for a monitoring probe.
     #>
     param(
         [datetime]$Now,
         [object[]]$Logical = @(),
         [hashtable]$Model,
         [object[]]$Finding = @(),
-        [string]$LsnStatus = 'n/a'
+        [string]$LsnStatus = 'n/a',
+        [string]$InstancePrefix
     )
 
     [string[]]$dbs = @()
@@ -386,6 +410,11 @@ function Get-RunSummary {
     $w = @($Finding | Where-Object { $_.Severity -eq 'Warning' }).Count
     $i = @($Finding | Where-Object { $_.Severity -eq 'Info' }).Count
     $tally = if (($e + $w + $i) -eq 0) { 'clean' } else { '{0}E {1}W {2}I' -f $e, $w, $i }
+
+    if ($InstancePrefix) {
+        return ('{0}  {1}  |  LSN {2}  |  BackupChainCheck {3:yyyy-MM-dd HH:mm}  |  @CleanupTime F/D/L {4}/{5}/{6}h  |  files F/D/L {7}/{8}/{9}  |  {10}' -f `
+                $InstancePrefix, $scope, $LsnStatus, $Now, $ret[0], $ret[1], $ret[2], $fc['FULL'], $fc['DIFF'], $fc['LOG'], $tally)
+    }
 
     return ('LSN {0}  |  BackupChainCheck {1:yyyy-MM-dd HH:mm}  |  {2}  |  @CleanupTime F/D/L {3}/{4}/{5}h  |  files F/D/L {6}/{7}/{8}  |  {9}' -f `
             $LsnStatus, $Now, $scope, $ret[0], $ret[1], $ret[2], $fc['FULL'], $fc['DIFF'], $fc['LOG'], $tally)
@@ -2325,6 +2354,19 @@ if ($MyInvocation.InvocationName -eq '.') { return }
 
 Write-Verbose "BackupChainCheck starting - $($script:Now.ToString('s'))"
 
+# -Database accepts both -Database A,B (array) and a single quoted 'A,B' list
+# (the style of Ola's own @Databases token); flatten to a plain pattern array.
+$Database = @($Database | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($Database.Count -eq 0) { $Database = @('*') }
+
+# -JustLSN is a one-line-only view: silence the informational warning stream
+# (job/path mismatches, empty scans) unless the caller asked for warnings
+# explicitly. -Quiet takes precedence over -JustLSN.
+if ($JustLSN -and $Quiet) { $JustLSN = $false }
+if ($JustLSN -and -not $PSBoundParameters.ContainsKey('WarningAction')) {
+    $WarningPreference = 'SilentlyContinue'
+}
+
 $config = $null
 if ($ConfigPath) {
     if (-not (Test-Path -LiteralPath $ConfigPath)) { throw "Config file not found: $ConfigPath" }
@@ -2455,10 +2497,23 @@ if ($lsn.Findings.Count -gt 0) { $findings = @($findings) + @($lsn.Findings) }
 
 $sorted = $findings | Sort-Object @{ E = { @('Error', 'Warning', 'Info').IndexOf($_.Severity) } }, Database, BackupType, Finding
 
-$summaryLine = Get-RunSummary -Now $script:Now -Logical $logical -Model $model -Finding $findings -LsnStatus $lsn.Status
+# -JustLSN leads the line with the server + database, so a monitoring probe can
+# key on it. Prefer the -SqlInstance name, then the instance parsed from the file
+# tree, then this host's name.
+$instancePrefix = ''
+if ($JustLSN) {
+    $instancePrefix = $SqlInstance
+    if (-not $instancePrefix) {
+        $fileInstances = @($logical | ForEach-Object { $_.Instance } | Where-Object { $_ } | Sort-Object -Unique)
+        if ($fileInstances.Count -eq 1) { $instancePrefix = $fileInstances[0] }
+    }
+    if (-not $instancePrefix) { $instancePrefix = $env:COMPUTERNAME }
+}
+
+$summaryLine = Get-RunSummary -Now $script:Now -Logical $logical -Model $model -Finding $findings -LsnStatus $lsn.Status -InstancePrefix $instancePrefix
 Write-Verbose $summaryLine
 
-if ($Advice -and -not $Quiet) {
+if ($Advice -and -not $Quiet -and -not $JustLSN) {
     $adviceLines = @(Get-BackupAdvice -Model $model -LogicalBackup $logical -DatabaseInfo $dbInfo)
     if ($adviceLines.Count -gt 0) {
         Write-Host ''
@@ -2468,33 +2523,60 @@ if ($Advice -and -not $Quiet) {
 }
 
 if (-not $Quiet) {
-    Write-Host ''
-    $lsnColor = switch ($lsn.Status) { 'valid' { 'Green' } 'error' { 'Red' } default { 'DarkYellow' } }
-    $lsnPrefix = "LSN $($lsn.Status)"
-    Write-Host 'LSN ' -ForegroundColor White -NoNewline
-    Write-Host $lsn.Status -ForegroundColor $lsnColor -NoNewline
-    Write-Host $summaryLine.Substring($lsnPrefix.Length)
-    if ($sorted) {
-        Write-Host ''
-        $sorted | Group-Object Severity | ForEach-Object { Write-Host ("  {0,-8} {1}" -f $_.Name, $_.Count) }
+    # Print one run-summary line, colouring the "LSN <status>" token wherever it
+    # sits (it is not at the start under -JustLSN, which prefixes server + db).
+    $writeSummaryLine = {
+        param([string]$Line, [string]$Status)
+        $color = switch ($Status) { 'valid' { 'Green' } 'error' { 'Red' } default { 'DarkYellow' } }
+        $token = "LSN $Status"
+        $at = $Line.IndexOf($token)
+        Write-Host $Line.Substring(0, $at) -NoNewline
+        Write-Host 'LSN ' -ForegroundColor White -NoNewline
+        Write-Host $Status -ForegroundColor $color -NoNewline
+        Write-Host $Line.Substring($at + $token.Length)
     }
-    elseif (-not $Predict) {
-        Write-Host 'No findings - retention, cadence and files on disk are consistent.' -ForegroundColor Green
+
+    if ($JustLSN) {
+        # One line per in-scope database, each with its own LSN verdict.
+        $justDbs = @($model.Keys | Sort-Object)
+        if ($justDbs.Count -eq 0) {
+            & $writeSummaryLine $summaryLine $lsn.Status
+        }
+        foreach ($jdb in $justDbs) {
+            $jLogical = @($logical | Where-Object { $_.Database -eq $jdb })
+            $jFinding = @($findings | Where-Object { $_.Database -eq $jdb })
+            $jHistory = @($backupHistory | Where-Object { $_.Database -eq $jdb })
+            $jStatus = (Test-LsnChain -History $jHistory -LogicalBackup $jLogical -DatabaseInfo $dbInfo).Status
+            $jLine = Get-RunSummary -Now $script:Now -Logical $jLogical -Model @{ $jdb = $model[$jdb] } `
+                -Finding $jFinding -LsnStatus $jStatus -InstancePrefix $instancePrefix
+            & $writeSummaryLine $jLine $jStatus
+        }
+    }
+    else {
+        Write-Host ''
+        & $writeSummaryLine $summaryLine $lsn.Status
+        if ($sorted) {
+            Write-Host ''
+            $sorted | Group-Object Severity | ForEach-Object { Write-Host ("  {0,-8} {1}" -f $_.Name, $_.Count) }
+        }
+        elseif (-not $Predict) {
+            Write-Host 'No findings - retention, cadence and files on disk are consistent.' -ForegroundColor Green
+        }
     }
 }
 
 if ($ReportPath) {
     Write-HtmlReport -Finding $sorted -Path $ReportPath -ScannedPath $BackupPath
-    if (-not $Quiet) { Write-Host "HTML report: $ReportPath" }
+    if (-not $Quiet -and -not $JustLSN) { Write-Host "HTML report: $ReportPath" }
 }
 
 $prediction = $null
 if ($Predict) {
     $prediction = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -History $backupHistory -ToleranceFactor $GapToleranceFactor)
-    if (-not $Quiet) { Write-PredictionMatrix -Prediction $prediction -LogicalBackup $logical }
+    if (-not $Quiet -and -not $JustLSN) { Write-PredictionMatrix -Prediction $prediction -LogicalBackup $logical }
 }
 
-if ($Graph -and -not $Quiet) {
+if ($Graph -and -not $Quiet -and -not $JustLSN) {
     Write-ChainGraph -History $backupHistory -LogicalBackup $logical -Model $model -ToleranceFactor $GapToleranceFactor
 }
 
@@ -2507,12 +2589,14 @@ if ($RestorePlan) {
     else {
         $restorePlans = @(Get-RestorePlan -History $backupHistory)
     }
-    if (-not $Quiet) { Write-RestorePlan -Plan $restorePlans }
+    if (-not $Quiet -and -not $JustLSN) { Write-RestorePlan -Plan $restorePlans }
 }
 
 # Emit objects on the pipeline: prediction records under -Predict, restore-plan
-# records under -RestorePlan, otherwise the findings.
-if ($Predict) { $prediction }
+# records under -RestorePlan, otherwise the findings. -JustLSN emits nothing -
+# the one summary line is the whole output (-FailOnGap still sets the exit code).
+if ($JustLSN) { }
+elseif ($Predict) { $prediction }
 elseif ($RestorePlan) { $restorePlans }
 else { $sorted }
 

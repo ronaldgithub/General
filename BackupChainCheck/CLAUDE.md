@@ -164,6 +164,26 @@ console/`-Predict`/`-Graph`/`-RestorePlan` output → HTML report → emit pipel
 objects (predictions under `-Predict`, restore plans under `-RestorePlan`, else
 findings) → `-FailOnGap` exit code.
 
+`-JustLSN` prints **one `Get-RunSummary` line per in-scope database** (each with
+its own per-db `Test-LsnChain` verdict, colour by status) and suppresses
+everything else — the findings breakdown, every `-Advice`/`-Predict`/`-Graph`/
+`-RestorePlan` view, the warning stream (unless `-WarningAction` is bound), **and
+the pipeline emit** (the final `if/elseif` block skips output entirely under
+`$JustLSN`, so the default `.Finding` table view does not render). Per-db lines
+loop `$model.Keys`; the shared `$writeSummaryLine` scriptblock locates the
+`LSN <status>` token with `IndexOf` (it is not at column 0 once `-InstancePrefix`
+prepends the `<server> / <db>` key). `-FailOnGap` still works (reads `$findings`, not
+the pipeline). `-Quiet` wins (Main clears `$JustLSN` when both set). Gate any new
+console block on `-not $Quiet -and -not $JustLSN`.
+
+`-Database` is normalised at the top of Main: every element is split on `,` and
+trimmed, so `-Database 'A,B'` (one quoted Ola-style list) and `-Database A,B`
+(two array elements) behave identically. Under `-JustLSN`, `Get-RunSummary` is called
+with `-InstancePrefix` (server + database key) so the line reads
+`<server>  <db>  |  LSN <status>  |  …` with no repeated scope field — which is
+why the console colouring locates the `LSN <status>` token with `IndexOf` rather
+than assuming it starts the string.
+
 **A future module split** (`BackupChainCheck.psd1` + `.psm1` + `src/` with one
 public function per file, `docs/ola-conventions.md`) is fine to do later, but keep
 the single-script entry point working — it is what the README documents.

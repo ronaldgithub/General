@@ -141,6 +141,7 @@ The tool **never writes to SQL Server and never deletes or modifies backup files
 .\Invoke-BackupChainCheck.ps1 -SqlInstance 'win11' -SolutionDatabase 'master' -BackupPath 'E:\backups\win11'
 
 .\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' -BackupPath '\\nas01\sqlbackup'
+.\Invoke-BackupChainCheck.ps1 -SqlInstance 'win10' -BackupPath '\\192.168.178.15\SQLBackup\'
 
 # Solution installed in a dedicated DBA database
 .\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' -SolutionDatabase 'DBA' -BackupPath 'D:\Backup'
@@ -319,6 +320,30 @@ finding tally:
 ```
 LSN valid  |  BackupChainCheck 2026-09-07 10:30  |  StackOverflow2010  |  @CleanupTime F/D/L 48/48/48h  |  files F/D/L 3/2/18  |  3E 4W 0I
 ```
+
+`-JustLSN` prints **one summary line per in-scope database and nothing else** —
+each led with the server and database as a greppable key, carrying that
+database's own LSN verdict, `@CleanupTime`, file counts and finding tally. No
+findings breakdown, no `-Advice` / `-Predict` / `-Graph` / `-RestorePlan` console
+output, and the job/path warnings are silenced (pass `-WarningAction Continue` to
+keep them):
+
+```
+WIN10  StackOverflow2010  |  LSN valid  |  BackupChainCheck 2026-09-08 16:44  |  @CleanupTime F/D/L 24/24/24h  |  files F/D/L 2/1/2  |  clean
+WIN10  StackOverflow2013  |  LSN error  |  BackupChainCheck 2026-09-08 16:44  |  @CleanupTime F/D/L 24/24/24h  |  files F/D/L 1/0/3  |  1E 2W 0I
+```
+
+![-JustLSN output, one line per database](pic/06.png)
+
+The server name is `-SqlInstance`, else the instance parsed from the backup file
+tree, else the checking host's name. Nothing is written to the pipeline either,
+so the lines stand alone — though `-FailOnGap` still sets the exit code. Handy
+for a monitoring probe or a status dashboard. `-Quiet` still wins if both are
+given.
+
+`-Database` takes a single comma-separated string too (Ola's `@Databases`
+style) — `-Database 'StackOverflow2010,StackOverflow2013'` is the same as
+`-Database StackOverflow2010,StackOverflow2013`.
 
 `LSN valid` / `error` / `n/a` (green / red / yellow on the console) comes from
 `Test-LsnChain`. With `-SqlInstance` it reads `msdb` history and checks that:
