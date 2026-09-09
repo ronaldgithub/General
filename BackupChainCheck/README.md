@@ -157,6 +157,13 @@ The tool **never writes to SQL Server and never deletes or modifies backup files
     -BackupPath 'D:\Backup','\\nas01\sqlbackup' `
     -ReportPath '.\report.html' -FailOnGap
 
+# Several servers in one run. Every -BackupPath root is scanned once; each server
+# is reconciled against the files whose <SERVER$INSTANCE> folder matches it.
+.\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01,SQL02,SQL03' -BackupPath '\\nas01\sqlbackup'
+
+# One greppable line per server + database, for a monitoring probe
+.\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01,SQL02' -BackupPath '\\nas01\sqlbackup' -JustLSN
+
 # One database: design advice, predicted-vs-actual matrix, ASCII chain timeline
 .\Invoke-BackupChainCheck.ps1 -SqlInstance 'SQL01' -BackupPath 'D:\Backup' `
     -Database 'Finance' -Advice -Predict -Graph
@@ -168,6 +175,14 @@ The tool **never writes to SQL Server and never deletes or modifies backup files
 
 `-Database` takes one or more `-like` wildcard patterns (default `*` = every
 database) and scopes the whole analysis, not just the printed table.
+
+`-SqlInstance` takes one or more instances (`-SqlInstance 'SQL01,SQL02'` or
+`-SqlInstance SQL01,SQL02`). With more than one, the analysis runs once per
+server: every `-BackupPath` root is scanned a single time and each server is
+reconciled against the backup files whose parsed `<SERVER$INSTANCE>` folder
+matches it. Output is a per-server block (or, under `-JustLSN`, one line per
+server + database); pipeline objects carry `Instance`; `-FailOnGap` returns the
+worst exit code across all servers.
 
 With `-SqlInstance`, the analysis is limited to databases that currently exist
 and are **ONLINE** in `sys.databases` — stale `dbo.CommandLog` rows and orphaned

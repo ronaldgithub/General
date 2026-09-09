@@ -49,6 +49,40 @@ Describe 'Test-DatabaseMatch' {
     }
 }
 
+Describe 'Test-InstanceMatch' {
+    It 'matches a default instance: bare server name vs SERVER folder' {
+        Test-InstanceMatch -FileInstance 'SQL01' -SqlInstance 'SQL01' | Should Be $true
+    }
+    It 'is case-insensitive on the host' {
+        Test-InstanceMatch -FileInstance 'sql01' -SqlInstance 'SQL01' | Should Be $true
+    }
+    It 'matches a named instance: SERVER$INST folder vs SERVER\INST' {
+        Test-InstanceMatch -FileInstance 'SQL01$PROD' -SqlInstance 'SQL01\PROD' | Should Be $true
+    }
+    It 'strips the domain from an FQDN -SqlInstance' {
+        Test-InstanceMatch -FileInstance 'SQL01' -SqlInstance 'sql01.opendata.local' | Should Be $true
+    }
+    It 'strips a ,port suffix from -SqlInstance' {
+        Test-InstanceMatch -FileInstance 'SQL01' -SqlInstance 'SQL01,1433' | Should Be $true
+    }
+    It 'treats MSSQLSERVER as the default instance' {
+        Test-InstanceMatch -FileInstance 'SQL01' -SqlInstance 'SQL01\MSSQLSERVER' | Should Be $true
+    }
+    It 'does not match a different host' {
+        Test-InstanceMatch -FileInstance 'SQL02' -SqlInstance 'SQL01' | Should Be $false
+    }
+    It 'does not match a different named instance on the same host' {
+        Test-InstanceMatch -FileInstance 'SQL01$PROD' -SqlInstance 'SQL01\TEST' | Should Be $false
+    }
+    It 'does not match a named-instance folder against a default-instance target' {
+        Test-InstanceMatch -FileInstance 'SQL01$PROD' -SqlInstance 'SQL01' | Should Be $false
+    }
+    It 'returns $false for blank input' {
+        Test-InstanceMatch -FileInstance '' -SqlInstance 'SQL01' | Should Be $false
+        Test-InstanceMatch -FileInstance 'SQL01' -SqlInstance '' | Should Be $false
+    }
+}
+
 Describe 'ConvertFrom-AgentTime' {
     It 'decodes HHMMSS to HH:mm' {
         ConvertFrom-AgentTime 180000 | Should Be '18:00'

@@ -39,9 +39,13 @@
     -Database 'StackOverflow2010,StackOverflow2013' is split into two patterns.
 
 .PARAMETER SqlInstance
-    Optional. SQL Server instance to read DatabaseBackup job configuration and
-    database metadata from (msdb + master, read-only). Windows auth unless
-    -SqlCredential is supplied.
+    Optional. One or more SQL Server instances to read DatabaseBackup job
+    configuration and database metadata from (msdb + master, read-only). Windows
+    auth unless -SqlCredential is supplied. Accepts -SqlInstance A,B or a single
+    'A,B' string. With more than one instance the analysis runs once per server:
+    every -BackupPath root is scanned once and each server is reconciled against
+    the files whose parsed <SERVER$INSTANCE> folder matches it. Output is a
+    per-server block; -FailOnGap returns the worst exit code across all servers.
 
 .PARAMETER SqlCredential
     Optional PSCredential for SQL authentication against -SqlInstance.
@@ -174,7 +178,7 @@ param(
 
     [string[]]$Database = '*',
 
-    [string]$SqlInstance,
+    [string[]]$SqlInstance,
 
     [System.Management.Automation.PSCredential]$SqlCredential,
 
@@ -276,6 +280,32 @@ function Test-DatabaseMatch {
         if ($Name -like $p) { return $true }
     }
     return $false
+}
+
+function Test-InstanceMatch {
+    <#
+        True when an Ola backup folder's parsed instance token ($FileInstance -
+        'SERVER' or 'SERVER$INSTANCE', possibly an FQDN) names the same SQL Server
+        instance as a -SqlInstance value ('SERVER', 'SERVER\INSTANCE',
+        'host.domain\INSTANCE', 'SERVER,1433'). The host is compared
+        case-insensitively on its leftmost label; a default instance is spelled
+        'MSSQLSERVER' or left blank on either side.
+    #>
+    param([string]$FileInstance, [string]$SqlInstance)
+    if ([string]::IsNullOrWhiteSpace($FileInstance) -or [string]::IsNullOrWhiteSpace($SqlInstance)) { return $false }
+
+    $sqlParts = $SqlInstance -split '\\', 2
+    $sqlHost = (($sqlParts[0]) -split '[,.]')[0].Trim()
+    $sqlInst = if ($sqlParts.Count -gt 1) { $sqlParts[1].Trim() } else { '' }
+    if ($sqlInst -eq 'MSSQLSERVER') { $sqlInst = '' }
+
+    $fileParts = $FileInstance -split '\$', 2
+    $fileHost = (($fileParts[0]) -split '\.')[0].Trim()
+    $fileInst = if ($fileParts.Count -gt 1) { $fileParts[1].Trim() } else { '' }
+    if ($fileInst -eq 'MSSQLSERVER') { $fileInst = '' }
+
+    if ($sqlHost -ne $fileHost) { return $false }   # string -eq is case-insensitive
+    return ($sqlInst -eq $fileInst)
 }
 
 function ConvertFrom-AgentTime {
@@ -516,13 +546,15 @@ function Get-BackupFileInventory {
 function Group-LogicalBackup {
     <#
         Collapses striped physical files into one logical backup keyed by
-        Database + BackupType + Timestamp (to the second).
+        Instance + Database + BackupType + Timestamp (to the second). Instance is
+        part of the key so two servers running a same-named database on the same
+        schedule do not merge into one logical backup in a multi-instance scan.
     #>
     param([object[]]$Record)
 
     $logical = New-Object System.Collections.Generic.List[object]
     $groups = $Record | Group-Object -Property {
-        '{0}|{1}|{2:yyyyMMddHHmmss}' -f $_.Database, $_.BackupType, $_.Timestamp
+        '{0}|{1}|{2}|{3:yyyyMMddHHmmss}' -f $_.Instance, $_.Database, $_.BackupType, $_.Timestamp
     }
     foreach ($g in $groups) {
         $first = $g.Group[0]
@@ -539,7 +571,7 @@ function Group-LogicalBackup {
                 Paths      = @($g.Group.Path)
             })
     }
-    return ($logical | Sort-Object Database, BackupType, Timestamp)
+    return ($logical | Sort-Object Instance, Database, BackupType, Timestamp)
 }
 
 #endregion
@@ -2380,50 +2412,82 @@ if (-not $IncludeCopyOnly) {
     $records = @($records | Where-Object { -not $_.IsCopyOnly })
 }
 
-$logical = @(Group-LogicalBackup -Record $records)
-Write-Verbose "Grouped into $($logical.Count) logical backup(s)."
+$logicalAll = @(Group-LogicalBackup -Record $records)
+Write-Verbose "Grouped into $($logicalAll.Count) logical backup(s)."
 
-$jobConfig = $null
-$jobSchedule = @()
-$dbInfo = $null
-$commandLog = $null
-$backupHistory = @()
-if ($SqlInstance) {
-    try {
-        $jobConfig = @(Get-OlaJobConfig -Instance $SqlInstance -Credential $SqlCredential)
-        $dbInfo = Get-SqlDatabaseInfo -Instance $SqlInstance -Credential $SqlCredential
-        Write-Verbose "Read $($jobConfig.Count) DatabaseBackup job step(s) and $($dbInfo.Count) database(s) from $SqlInstance."
-    }
-    catch {
-        Write-Warning "Could not read configuration from $SqlInstance : $($_.Exception.Message)"
-    }
-    try {
-        $jobSchedule = @(Get-OlaJobSchedule -Instance $SqlInstance -Credential $SqlCredential)
-        Write-Verbose "Read $($jobSchedule.Count) DatabaseBackup job schedule(s) from $SqlInstance."
-    }
-    catch {
-        Write-Warning "Could not read job schedules from $SqlInstance : $($_.Exception.Message)"
-    }
-    try {
-        $commandLog = Get-OlaCommandLog -Instance $SqlInstance -Database $SolutionDatabase -SinceHours $HistoryHours -Credential $SqlCredential
-        if ($null -eq $commandLog) {
-            Write-Warning "dbo.CommandLog not found in [$SolutionDatabase] on $SqlInstance - pass -SolutionDatabase if the Maintenance Solution lives elsewhere."
-        }
-        else {
-            Write-Verbose "Read $($commandLog.Count) CommandLog backup row(s) from [$SolutionDatabase]."
+# -SqlInstance accepts -SqlInstance A,B and a single 'A,B' string (like -Database).
+# Zero instances = one pass with no SQL - the original single-target behaviour.
+$instances = @($SqlInstance | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$multiInstance = $instances.Count -gt 1
+if ($instances.Count -eq 0) { $instances = @('') }
+
+# Results accumulated across every instance, for one combined HTML report,
+# one pipeline stream, and one worst-case -FailOnGap exit code.
+$allSorted = New-Object System.Collections.Generic.List[object]
+$allPrediction = New-Object System.Collections.Generic.List[object]
+$allRestore = New-Object System.Collections.Generic.List[object]
+$anyError = $false
+$anyWarn = $false
+
+foreach ($inst in $instances) {
+    $isSql = -not [string]::IsNullOrWhiteSpace($inst)
+
+    # "Every path scanned for every server": one shared file inventory; each
+    # instance keeps only the files whose parsed <SERVER$INSTANCE> matches it.
+    # If nothing matches and it is the only instance, fall back to all files
+    # (a single-server run pointed straight at that server's own folder).
+    if ($isSql) {
+        $logical = @($logicalAll | Where-Object { Test-InstanceMatch -FileInstance $_.Instance -SqlInstance $inst })
+        if ($logical.Count -eq 0) {
+            if ($multiInstance) { Write-Warning "No backup files under -BackupPath match instance '$inst'." }
+            else { $logical = $logicalAll }
         }
     }
-    catch {
-        Write-Warning "Could not read dbo.CommandLog from [$SolutionDatabase] on $SqlInstance : $($_.Exception.Message)"
+    else {
+        $logical = $logicalAll
     }
-    try {
-        $backupHistory = @(Get-BackupSetHistory -Instance $SqlInstance -SinceHours $HistoryHours -Credential $SqlCredential)
-        Write-Verbose "Read $($backupHistory.Count) backup-set history record(s) from msdb on $SqlInstance."
+
+    $jobConfig = $null
+    $jobSchedule = @()
+    $dbInfo = $null
+    $commandLog = $null
+    $backupHistory = @()
+    if ($isSql) {
+        try {
+            $jobConfig = @(Get-OlaJobConfig -Instance $inst -Credential $SqlCredential)
+            $dbInfo = Get-SqlDatabaseInfo -Instance $inst -Credential $SqlCredential
+            Write-Verbose "Read $($jobConfig.Count) DatabaseBackup job step(s) and $($dbInfo.Count) database(s) from $inst."
+        }
+        catch {
+            Write-Warning "Could not read configuration from $inst : $($_.Exception.Message)"
+        }
+        try {
+            $jobSchedule = @(Get-OlaJobSchedule -Instance $inst -Credential $SqlCredential)
+            Write-Verbose "Read $($jobSchedule.Count) DatabaseBackup job schedule(s) from $inst."
+        }
+        catch {
+            Write-Warning "Could not read job schedules from $inst : $($_.Exception.Message)"
+        }
+        try {
+            $commandLog = Get-OlaCommandLog -Instance $inst -Database $SolutionDatabase -SinceHours $HistoryHours -Credential $SqlCredential
+            if ($null -eq $commandLog) {
+                Write-Warning "dbo.CommandLog not found in [$SolutionDatabase] on $inst - pass -SolutionDatabase if the Maintenance Solution lives elsewhere."
+            }
+            else {
+                Write-Verbose "Read $($commandLog.Count) CommandLog backup row(s) from [$SolutionDatabase]."
+            }
+        }
+        catch {
+            Write-Warning "Could not read dbo.CommandLog from [$SolutionDatabase] on $inst : $($_.Exception.Message)"
+        }
+        try {
+            $backupHistory = @(Get-BackupSetHistory -Instance $inst -SinceHours $HistoryHours -Credential $SqlCredential)
+            Write-Verbose "Read $($backupHistory.Count) backup-set history record(s) from msdb on $inst."
+        }
+        catch {
+            Write-Warning "Could not read backup history from msdb on $inst : $($_.Exception.Message)"
+        }
     }
-    catch {
-        Write-Warning "Could not read backup history from msdb on $SqlInstance : $($_.Exception.Message)"
-    }
-}
 
 # Drop databases that no longer exist / are not ONLINE in sys.databases - stale
 # dbo.CommandLog rows and orphaned files for dropped or renamed databases.
@@ -2495,6 +2559,11 @@ $lsn = Test-LsnChain -History $backupHistory -LogicalBackup $logical -DatabaseIn
 Write-Verbose "LSN chain status: $($lsn.Status) ($($lsn.Findings.Count) finding(s))."
 if ($lsn.Findings.Count -gt 0) { $findings = @($findings) + @($lsn.Findings) }
 
+# Stamp every finding with the instance it belongs to, so a multi-server run
+# stays groupable on the pipeline (New-Finding fills Instance from the file tree;
+# the -SqlInstance name is the stable key when we have it).
+if ($isSql) { foreach ($f in $findings) { $f.Instance = $inst } }
+
 $sorted = $findings | Sort-Object @{ E = { @('Error', 'Warning', 'Info').IndexOf($_.Severity) } }, Database, BackupType, Finding
 
 # -JustLSN leads the line with the server + database, so a monitoring probe can
@@ -2502,7 +2571,7 @@ $sorted = $findings | Sort-Object @{ E = { @('Error', 'Warning', 'Info').IndexOf
 # tree, then this host's name.
 $instancePrefix = ''
 if ($JustLSN) {
-    $instancePrefix = $SqlInstance
+    $instancePrefix = $inst
     if (-not $instancePrefix) {
         $fileInstances = @($logical | ForEach-Object { $_.Instance } | Where-Object { $_ } | Sort-Object -Unique)
         if ($fileInstances.Count -eq 1) { $instancePrefix = $fileInstances[0] }
@@ -2512,6 +2581,13 @@ if ($JustLSN) {
 
 $summaryLine = Get-RunSummary -Now $script:Now -Logical $logical -Model $model -Finding $findings -LsnStatus $lsn.Status -InstancePrefix $instancePrefix
 Write-Verbose $summaryLine
+
+# Per-server banner for the multi-instance block view (not under -JustLSN, whose
+# every line already starts with the server name).
+if ($multiInstance -and -not $Quiet -and -not $JustLSN) {
+    Write-Host ''
+    Write-Host ('===  {0}  ' -f $inst).PadRight(60, '=') -ForegroundColor Cyan
+}
 
 if ($Advice -and -not $Quiet -and -not $JustLSN) {
     $adviceLines = @(Get-BackupAdvice -Model $model -LogicalBackup $logical -DatabaseInfo $dbInfo)
@@ -2565,46 +2641,55 @@ if (-not $Quiet) {
     }
 }
 
+    # --- accumulate this instance's results for the combined outputs ---
+    foreach ($s in $sorted) { [void]$allSorted.Add($s) }
+    if (@($findings | Where-Object { $_.Severity -eq 'Error' }).Count -gt 0) { $anyError = $true }
+    if (@($findings | Where-Object { $_.Severity -eq 'Warning' }).Count -gt 0) { $anyWarn = $true }
+
+    $prediction = $null
+    if ($Predict) {
+        $prediction = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -History $backupHistory -ToleranceFactor $GapToleranceFactor)
+        if (-not $Quiet -and -not $JustLSN) { Write-PredictionMatrix -Prediction $prediction -LogicalBackup $logical }
+        foreach ($p in $prediction) { [void]$allPrediction.Add($p) }
+    }
+
+    if ($Graph -and -not $Quiet -and -not $JustLSN) {
+        Write-ChainGraph -History $backupHistory -LogicalBackup $logical -Model $model -ToleranceFactor $GapToleranceFactor
+    }
+
+    $restorePlans = $null
+    if ($RestorePlan) {
+        if ($backupHistory.Count -eq 0) {
+            Write-Warning 'RestorePlan needs msdb history - supply -SqlInstance.'
+            $restorePlans = @()
+        }
+        else {
+            $restorePlans = @(Get-RestorePlan -History $backupHistory)
+        }
+        if (-not $Quiet -and -not $JustLSN) { Write-RestorePlan -Plan $restorePlans }
+        foreach ($rp in $restorePlans) { [void]$allRestore.Add($rp) }
+    }
+}
+# --- end per-instance loop ---
+
 if ($ReportPath) {
-    Write-HtmlReport -Finding $sorted -Path $ReportPath -ScannedPath $BackupPath
+    Write-HtmlReport -Finding @($allSorted) -Path $ReportPath -ScannedPath $BackupPath
     if (-not $Quiet -and -not $JustLSN) { Write-Host "HTML report: $ReportPath" }
-}
-
-$prediction = $null
-if ($Predict) {
-    $prediction = @(Get-BackupPrediction -LogicalBackup $logical -Model $model -History $backupHistory -ToleranceFactor $GapToleranceFactor)
-    if (-not $Quiet -and -not $JustLSN) { Write-PredictionMatrix -Prediction $prediction -LogicalBackup $logical }
-}
-
-if ($Graph -and -not $Quiet -and -not $JustLSN) {
-    Write-ChainGraph -History $backupHistory -LogicalBackup $logical -Model $model -ToleranceFactor $GapToleranceFactor
-}
-
-$restorePlans = $null
-if ($RestorePlan) {
-    if ($backupHistory.Count -eq 0) {
-        Write-Warning 'RestorePlan needs msdb history - supply -SqlInstance.'
-        $restorePlans = @()
-    }
-    else {
-        $restorePlans = @(Get-RestorePlan -History $backupHistory)
-    }
-    if (-not $Quiet -and -not $JustLSN) { Write-RestorePlan -Plan $restorePlans }
 }
 
 # Emit objects on the pipeline: prediction records under -Predict, restore-plan
 # records under -RestorePlan, otherwise the findings. -JustLSN emits nothing -
-# the one summary line is the whole output (-FailOnGap still sets the exit code).
+# the summary lines are the whole output (-FailOnGap still sets the exit code).
 if ($JustLSN) { }
-elseif ($Predict) { $prediction }
-elseif ($RestorePlan) { $restorePlans }
-else { $sorted }
+elseif ($Predict) { $allPrediction }
+elseif ($RestorePlan) { $allRestore }
+else { $allSorted }
 
 if ($FailOnGap) {
-    $hasError = @($findings | Where-Object { $_.Severity -eq 'Error' }).Count -gt 0
-    $hasWarn = @($findings | Where-Object { $_.Severity -eq 'Warning' }).Count -gt 0
-    if ($hasError) { exit 1 }
-    elseif ($hasWarn) { exit 2 }
+    # Worst exit code across every instance: 1 if any server had an Error, else
+    # 2 if any had a Warning, else 0.
+    if ($anyError) { exit 1 }
+    elseif ($anyWarn) { exit 2 }
     else { exit 0 }
 }
 

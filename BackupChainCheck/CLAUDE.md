@@ -79,6 +79,12 @@ Internal structure of the script, in order:
 - `ConvertFrom-OlaBackupFile` — one FileInfo (or stand-in) → parsed record.
   Directory structure trusted first, file name is the fallback.
 - `Get-BackupFileInventory` / `Group-LogicalBackup` — scan + collapse striping.
+  `Group-LogicalBackup` keys on `Instance + Database + BackupType + Timestamp`
+  (Instance included so two servers running a same-named DB on the same schedule
+  do not merge in a multi-instance scan).
+- `Test-InstanceMatch` — does an Ola `<SERVER$INSTANCE>` folder token name the
+  same instance as a `-SqlInstance` value (`SERVER\INST`, FQDN, `SERVER,port`)?
+  Host compared on the leftmost label; default instance = `MSSQLSERVER` or blank.
 - `Invoke-SqlQuery` — thin read-only ADO.NET helper.
 - `Get-OlaJobConfig` — regex `@CleanupTime` / `@CleanupMode` / `@NumberOfFiles` /
   `@BackupType` / `@Databases` / `@Directory` out of `msdb.dbo.sysjobsteps`.
@@ -155,14 +161,21 @@ and any `$restorePlan` local are the same variable (PowerShell is
 case-insensitive) — Main uses `$restorePlans` for the result to avoid clobbering
 the switch. Same trap waits for any future `$predict` / `$graph` / `$advice`.
 
-`#region Main`, in order: load config → scan files → (`-SqlInstance`) read job
-config, schedule, `CommandLog`, backup history → drop non-ONLINE / dropped
-databases unless `-IncludeOfflineDatabases` → apply `-Database` scope →
+`#region Main`, in order: load config → scan **all** `-BackupPath` roots once
+(`$logicalAll`) → split `-SqlInstance` on `,` into `$instances` (empty ⇒ one pass
+with no SQL, the original behaviour) → **`foreach ($inst in $instances)`**: pick
+this server's files (`Test-InstanceMatch` against `$logicalAll`; fall back to all
+files only when a lone instance matches nothing) → (`$isSql`) read job config,
+schedule, `CommandLog`, backup history → drop non-ONLINE / dropped databases
+unless `-IncludeOfflineDatabases` → apply `-Database` scope →
 `Get-ExpectationModel` → `Test-BackupChain` → `Join-BackupSetToFile` (annotate
-history once) → `Test-LsnChain` → merge findings → `Get-RunSummary` +
-console/`-Predict`/`-Graph`/`-RestorePlan` output → HTML report → emit pipeline
-objects (predictions under `-Predict`, restore plans under `-RestorePlan`, else
-findings) → `-FailOnGap` exit code.
+history once) → `Test-LsnChain` → merge findings → stamp `.Instance = $inst` on
+every finding → `Get-RunSummary` + per-server banner (multi-instance, non-JustLSN)
++ console/`-Predict`/`-Graph`/`-RestorePlan` output → accumulate into
+`$allSorted` / `$allPrediction` / `$allRestore` / `$anyError` / `$anyWarn`.
+After the loop: one combined HTML report → emit the accumulated pipeline objects
+(predictions under `-Predict`, restore plans under `-RestorePlan`, else findings)
+→ `-FailOnGap` exits on the **worst** code across all servers.
 
 `-JustLSN` prints **one `Get-RunSummary` line per in-scope database** (each with
 its own per-db `Test-LsnChain` verdict, colour by status) and suppresses
